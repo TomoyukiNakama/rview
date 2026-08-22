@@ -1,0 +1,24 @@
+/target
+
+# macOS
+.DS_Store
+._*
+
+# local settings
+.claude/settings.local.json
+
+# .NET build output
+doc/view/bin/
+doc/view/obj/
+
+# assets (large binaries)
+/assets/
+
+# Visual Studio user settings
+*.user
+
+# Claude Code local settings
+.claude/
+
+# 移植元 WPF アプリのソース（別プロジェクトのためローカル参照のみ）
+/doc/view/
