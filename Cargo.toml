@@ -14,6 +14,7 @@ name = "rview"
 path = "src/main.rs"
 
 [dependencies]
+ab_glyph = "0.2"
 eframe = "0.31"
 egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }

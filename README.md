@@ -30,18 +30,18 @@ rview path/to/dir        # 指定したディレクトリの画像を開く
 ## 日本語表示用フォントの設定
 
 フォントファイルはサイズが大きいためリポジトリに含めていない。
-未設定でも起動するが、日本語のファイル名などが表示できない（豆腐になる）。
+起動時に以下の順で日本語フォントを探し、見つからなければ日本語が表示できない（豆腐になる）。
+対応形式は `.ttf` / `.otf` / `.ttc` / `.otc`。
 
-次のいずれかの方法でフォントを用意する。egui の制約により、
-**`.ttf` / `.otf` のみ対応**（`.ttc` フォントコレクションは読み込めない）。
-
-1. 環境変数で指定する
+1. 環境変数 `RVIEW_FONT` による明示指定
 
    ```bash
    RVIEW_FONT=/path/to/font.ttf rview
+   # .ttc（フォントコレクション）はフェイス番号を付けて指定できる
+   RVIEW_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0 rview
    ```
 
-2. 既定のパスに配置する（実行ファイルと同じディレクトリ、またはカレントディレクトリからの相対パス）
+2. 同梱フォント（実行ファイルのあるディレクトリとその上位、またはカレントディレクトリからの相対パス）
 
    ```
    assets/fonts/HackGen_NF_v2.10.0/HackGenConsoleNF-Regular.ttf
@@ -50,15 +50,13 @@ rview path/to/dir        # 指定したディレクトリの画像を開く
    開発時に使用しているフォントは [HackGen (白源)](https://github.com/yuru7/HackGen)（SIL Open Font License 1.1）。
    [Noto Sans JP](https://fonts.google.com/noto/specimen/Noto+Sans+JP) など他の `.ttf` でもよい。
 
-3. Linux では以下のシステムフォントが存在すれば自動で使われる
+3. fontconfig（`fc-match :lang=ja`）が返す日本語フォント
 
-   ```
-   /usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf
-   /usr/share/fonts/truetype/fonts-japanese-gothic.ttf
-   /usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf
-   /usr/share/fonts/truetype/ipafont/ipagp.ttf
-   /usr/share/fonts/truetype/ipafont-gothic/ipagp.ttf
-   ```
+4. フォントディレクトリ（`~/.fonts`、`~/.local/share/fonts`、`/usr/share/fonts`、
+   macOS の `Library/Fonts`、Windows の `%WINDIR%\Fonts` など）の走査
+
+いずれの候補も実際に読み込んで「あ」「漢」のグリフを持つことを確認してから採用するため、
+日本語を含まないフォントや壊れたファイルを掴むことはない。
 
 ## 主なキーボードショートカット
 

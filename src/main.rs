@@ -1335,71 +1335,245 @@ impl eframe::App for App {
     }
 }
 
-// リポジトリに同梱していないフォントの既定の配置場所
-// （実行ファイルの隣、またはカレントディレクトリからの相対パス）
+// 同梱フォントの既定の配置場所（実行ファイルの隣、またはカレントディレクトリからの相対パス）
 const BUNDLED_FONT_RELATIVE_PATH: &str =
     "assets/fonts/HackGen_NF_v2.10.0/HackGenConsoleNF-Regular.ttf";
+
+// フォント探索で「日本語が出るか」を判定するために使う文字
+// （ひらがな・漢字の両方が揃っているフォントだけを採用する）
+const JAPANESE_PROBE_CHARS: [char; 2] = ['あ', '漢'];
+
+// 実行ファイルのあるディレクトリから何階層上まで assets/ を探すか
+// （target/release/rview から見てリポジトリルートに届くようにする）
+const EXE_ANCESTOR_SEARCH_DEPTH: usize = 4;
+
+// ファイル名にこれらが含まれるフォントを日本語フォント候補として優先する
+// （前にあるものほど優先度が高い）
+const JAPANESE_FONT_NAME_HINTS: [&str; 12] = [
+    "notosanscjk",
+    "notosansjp",
+    "hackgen",
+    "sourcehansans",
+    "ipag",
+    "ipam",
+    "vl-",
+    "vlgothic",
+    "takao",
+    "migu",
+    "meiryo",
+    "yugoth",
+];
+
+// 探索時に実際にパースするフォントの上限
+// （システムのフォントディレクトリが巨大な場合に起動が遅くならないようにする）
+const MAX_FONT_PARSE_ATTEMPTS: usize = 40;
+
+// 日本語表示用フォント（ファイル内容とフォントフェイス番号）
+struct JapaneseFont {
+    bytes: Vec<u8>,
+    index: u32,
+}
 
 // 日本語表示用フォントを探す。見つからなければ None を返す。
 //
 // フォントファイルはリポジトリに含めていないため、実行時に探索する。
-// egui は内部で ab_glyph を使う関係で .ttc（フォントコレクション）を読めず、
-// 渡すと set_fonts でパニックするため、候補は .ttf / .otf のみに絞る。
-fn find_japanese_font() -> Option<Vec<u8>> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+// 候補はファイル名で並べたうえで実際にパースし、日本語グリフを持つものだけを採用する。
+// （壊れたファイルや日本語を含まないフォントを掴んで set_fonts でパニックするのを防ぐ）
+fn find_japanese_font() -> Option<JapaneseFont> {
+    let mut tried: Vec<(PathBuf, u32)> = Vec::new();
 
     // 1. 環境変数 RVIEW_FONT による明示指定を最優先
-    if let Some(path) = std::env::var_os("RVIEW_FONT") {
-        candidates.push(PathBuf::from(path));
+    //    "path" のほか "path#2" のようにフォントフェイス番号も指定できる（.ttc 用）
+    if let Some(value) = std::env::var_os("RVIEW_FONT") {
+        if let Some(font) = try_candidates(vec![parse_font_spec(&value)], &mut tried) {
+            return Some(font);
+        }
     }
 
-    // 2. 実行ファイルと同じディレクトリ配下（配布時にフォントを同梱する場合）
+    // 2. 実行ファイルのあるディレクトリとその上位（配布時に同梱する場合／
+    //    target/release から起動した場合にリポジトリルートの assets を拾う）、
+    //    およびカレントディレクトリ配下（cargo run でリポジトリルートから起動した場合）
+    let mut bundled: Vec<(PathBuf, u32)> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(BUNDLED_FONT_RELATIVE_PATH));
+            for ancestor in dir.ancestors().take(EXE_ANCESTOR_SEARCH_DEPTH) {
+                bundled.push((ancestor.join(BUNDLED_FONT_RELATIVE_PATH), 0));
+            }
         }
     }
+    bundled.push((PathBuf::from(BUNDLED_FONT_RELATIVE_PATH), 0));
+    if let Some(font) = try_candidates(bundled, &mut tried) {
+        return Some(font);
+    }
 
-    // 3. カレントディレクトリ配下（cargo run でリポジトリルートから起動した場合）
-    candidates.push(PathBuf::from(BUNDLED_FONT_RELATIVE_PATH));
+    // 3. fontconfig に日本語フォントを問い合わせる（Linux などで最も確実）
+    if let Some(font) = try_candidates(fontconfig_candidates(), &mut tried) {
+        return Some(font);
+    }
 
-    // 4. システムにインストールされている日本語フォント
-    candidates.extend(system_font_candidates().into_iter().map(PathBuf::from));
+    // 4. フォントディレクトリを走査して日本語フォントらしいものを試す
+    try_candidates(scan_font_dirs(), &mut tried)
+}
 
-    for path in candidates {
-        if !is_supported_font_file(&path) {
+// 候補を順に読み込み、日本語グリフを持つ最初のフォントを返す
+// tried には試したパスを記録し、同じファイルを二度パースしないようにする
+fn try_candidates(
+    candidates: Vec<(PathBuf, u32)>,
+    tried: &mut Vec<(PathBuf, u32)>,
+) -> Option<JapaneseFont> {
+    let mut attempts = 0;
+    for (path, index) in candidates {
+        if !is_supported_font_file(&path) || tried.contains(&(path.clone(), index)) {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&path) {
-            return Some(bytes); // 存在しない候補は黙って次へ
+        tried.push((path.clone(), index));
+
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue; // 存在しない候補は黙って次へ
+        };
+        attempts += 1;
+        if let Some(font) = load_if_japanese(bytes, index) {
+            return Some(font);
+        }
+        if attempts >= MAX_FONT_PARSE_ATTEMPTS {
+            break;
         }
     }
-
     None
 }
 
-// egui が読める拡張子か（.ttc などのコレクション形式は読めない）
+// "path" または "path#index" 形式の指定をパスとフォントフェイス番号に分解する
+fn parse_font_spec(value: &std::ffi::OsStr) -> (PathBuf, u32) {
+    if let Some(text) = value.to_str() {
+        if let Some((path, index)) = text.rsplit_once('#') {
+            if let Ok(index) = index.parse::<u32>() {
+                return (PathBuf::from(path), index);
+            }
+        }
+    }
+    (PathBuf::from(value), 0)
+}
+
+// フォントを実際にパースし、日本語グリフを持っていれば採用する
+fn load_if_japanese(bytes: Vec<u8>, index: u32) -> Option<JapaneseFont> {
+    use ab_glyph::Font as _;
+
+    let font = ab_glyph::FontRef::try_from_slice_and_index(&bytes, index).ok()?;
+    if JAPANESE_PROBE_CHARS
+        .iter()
+        .any(|&c| font.glyph_id(c).0 == 0)
+    {
+        return None; // 日本語グリフが欠けているフォントは使わない
+    }
+    Some(JapaneseFont { bytes, index })
+}
+
+// egui（ab_glyph）が読める拡張子か
+// .ttc（フォントコレクション）もフォントフェイス番号を指定すれば読める
 fn is_supported_font_file(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf"),
+        Some(ext) => ["ttf", "otf", "ttc", "otc"]
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known)),
         None => false,
     }
 }
 
-// プラットフォームごとのシステムフォント候補
-// Windows/macOS の標準日本語フォントは .ttc のため候補にできず、
-// ユーザーが RVIEW_FONT で指定するかフォントを同梱する運用になる。
-fn system_font_candidates() -> Vec<&'static str> {
-    if cfg!(target_os = "linux") {
-        vec![
-            "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
-            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-            "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
-            "/usr/share/fonts/truetype/ipafont/ipagp.ttf",
-            "/usr/share/fonts/truetype/ipafont-gothic/ipagp.ttf",
-        ]
+// fontconfig（fc-match）に日本語フォントを問い合わせる
+// fontconfig が無い環境では静かに空を返す
+fn fontconfig_candidates() -> Vec<(PathBuf, u32)> {
+    if cfg!(not(unix)) {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    for pattern in [":lang=ja", "sans-serif:lang=ja", "monospace:lang=ja"] {
+        let Ok(output) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}\t%{index}", pattern])
+            .output()
+        else {
+            return found; // fc-match が無い
+        };
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let (file, index) = match text.split_once('\t') {
+            Some((file, index)) => (file, index.trim().parse().unwrap_or(0)),
+            None => (text.as_str(), 0),
+        };
+        if !file.is_empty() {
+            found.push((PathBuf::from(file), index));
+        }
+    }
+    found
+}
+
+// フォントディレクトリを走査し、日本語フォントらしいファイルを優先度順に返す
+fn scan_font_dirs() -> Vec<(PathBuf, u32)> {
+    let mut hits: Vec<(usize, PathBuf)> = Vec::new();
+    for dir in font_dirs() {
+        collect_japanese_fonts(&dir, 0, &mut hits);
+    }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, path)| (path, 0)).collect()
+}
+
+// 走査対象のフォントディレクトリ（プラットフォームごと）
+fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    if cfg!(target_os = "windows") {
+        if let Some(windir) = std::env::var_os("WINDIR") {
+            dirs.push(PathBuf::from(windir).join("Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+        }
+    } else if cfg!(target_os = "macos") {
+        if let Some(home) = &home {
+            dirs.push(home.join("Library/Fonts"));
+        }
+        dirs.push(PathBuf::from("/Library/Fonts"));
+        dirs.push(PathBuf::from("/System/Library/Fonts"));
     } else {
-        Vec::new()
+        if let Some(home) = &home {
+            dirs.push(home.join(".fonts"));
+            dirs.push(home.join(".local/share/fonts"));
+        }
+        dirs.push(PathBuf::from("/usr/local/share/fonts"));
+        dirs.push(PathBuf::from("/usr/share/fonts"));
+    }
+    dirs
+}
+
+// ディレクトリを再帰的に走査して、日本語フォント候補を優先度つきで集める
+fn collect_japanese_fonts(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBuf)>) {
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_japanese_fonts(&path, depth + 1, out);
+            continue;
+        }
+        if !is_supported_font_file(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        if let Some(rank) = JAPANESE_FONT_NAME_HINTS.iter().position(|h| name.contains(h)) {
+            // 同じ書体なら Regular を優先する
+            let weight_penalty = usize::from(!name.contains("regular"));
+            out.push((rank * 2 + weight_penalty, path));
+        }
     }
 }
 
@@ -1410,11 +1584,12 @@ fn system_font_candidates() -> Vec<&'static str> {
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    let Some(bytes) = find_japanese_font() else {
+    let Some(font) = find_japanese_font() else {
         eprintln!(
             "日本語フォントが見つかりませんでした。日本語を表示するには、\n\
-             .ttf/.otf フォントを {BUNDLED_FONT_RELATIVE_PATH} に配置するか、\n\
-             環境変数 RVIEW_FONT にフォントファイルのパスを指定してください。"
+             .ttf/.otf/.ttc フォントを {BUNDLED_FONT_RELATIVE_PATH} に配置するか、\n\
+             環境変数 RVIEW_FONT にフォントファイルのパスを指定してください。\n\
+             （.ttc は RVIEW_FONT=/path/to/font.ttc#0 のようにフェイス番号を指定できます）"
         );
         ctx.set_fonts(fonts);
         return;
@@ -1422,7 +1597,12 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         "my_font".to_owned(),
-        egui::FontData::from_owned(bytes).into(),
+        egui::FontData {
+            font: std::borrow::Cow::Owned(font.bytes),
+            index: font.index,
+            tweak: Default::default(),
+        }
+        .into(),
     );
 
     // Proportional (プロポーショナル) フォントファミリーの先頭にカスタムフォントを追加
