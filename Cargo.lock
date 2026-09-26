@@ -2577,10 +2577,14 @@ name = "rview"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "crc32fast",
  "eframe",
  "egui",
+ "gif",
  "image",
+ "image-webp",
  "raw-window-handle",
+ "tiff",
  "url",
  "wayland-backend",
  "wayland-client",

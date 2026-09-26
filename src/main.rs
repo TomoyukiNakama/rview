@@ -4,6 +4,8 @@ use egui::{ColorImage, TextureHandle, TextureOptions}; // eguiから画像関連
 use std::path::{Path, PathBuf}; // ファイルパスを扱うための型
 use std::time::{Duration, Instant}; // 時間を扱うための型
 
+mod rotate_save; // 回転画像のメタデータ保持保存
+
 // ソート順を定義する列挙型
 #[derive(PartialEq, Clone, Copy)]
 enum SortOrder {
@@ -31,6 +33,10 @@ enum MenuAction {
     CopyFolderPath,     // 親フォルダのパスをクリップボードにコピー
     OpenFolder,         // 親フォルダをファイルエクスプローラーで開く
     Rotate(f32),        // 指定した角度で画像を回転
+    FlipHorizontal,     // 画像を左右反転
+    FlipVertical,       // 画像を上下反転
+    SaveOverwrite,      // 回転した画像を上書き保存
+    SaveAsNew,          // 回転した画像を別名で新規保存
     Reload,             // 現在の画像を再読み込み
     ResizeWindow,       // 画像のサイズに合わせてウインドウをリサイズ
     Quit,               // アプリケーションを終了
@@ -99,6 +105,12 @@ struct App {
     is_sliding: bool,                         // スライドショーが有効かどうか
     slide_last: Instant,                      // 最後にスライドショーで画像を変更した時刻
     rotation_angle: f32,                      // 画像の回転角度 (度)
+    flip_h: bool,                             // 左右反転（画面上で回転の後に適用）
+    flip_v: bool,                             // 上下反転（画面上で回転の後に適用）
+    // 上書き保存でファイルに焼き込んだ変換と、そのファイル。
+    // 回転・反転の状態は保存後も次の画像へ引き継ぐが、保存した画像自体は既に変換済みなので、
+    // 表示中はこの分を差し引いて二重に回転しないようにする
+    applied_transform: Option<(PathBuf, rotate_save::Transform)>,
     key_overlay_text: String,                 // オーバーレイ表示するテキスト
     key_overlay_hide_at: Option<Instant>,     // オーバーレイを非表示にする時刻
     last_scroll_shift: Option<Instant>,        // スクロールデバウンス用タイムスタンプ
@@ -115,7 +127,7 @@ struct App {
     #[cfg(target_os = "linux")]
     x11_window_id: Option<u32>,  // X11 ウィンドウIDのキャッシュ（XDND用）
     #[cfg(target_os = "linux")]
-    wayland_dnd: Option<WaylandDndContext>, // Wayland DnD コンテキスト
+    wayland_dnd: Option<SharedWaylandDnd>, // Wayland DnD コンテキスト（イベント監視スレッドと共有）
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pending_file_drag: bool,      // ドラッグを開始するフラグ
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -150,6 +162,9 @@ impl App {
             is_sliding: false,
             slide_last: Instant::now(),
             rotation_angle: 0.0,
+            flip_h: false,
+            flip_v: false,
+            applied_transform: None,
             key_overlay_text: String::new(),
             key_overlay_hide_at: None,
             last_scroll_shift: None,
@@ -288,7 +303,11 @@ impl App {
         }
         let path = self.images[self.current_index].clone();
         self.current_file = Some(path.clone());
-        self.rotation_angle = 0.0; // 読み込み時に回転をリセット
+        // 回転角度はリセットせず、次の画像にも引き継ぐ。
+        // 上書き保存した画像から離れたら、差し引き（applied_transform）は不要になる
+        if self.applied_transform.as_ref().is_some_and(|(p, _)| *p != path) {
+            self.applied_transform = None;
+        }
 
         // まずキャッシュからテクスチャを探す
         if let Some(texture) = self.texture_cache.get(&path) {
@@ -450,63 +469,98 @@ impl App {
 
     // 画像の回転角度を相対的に変更する
     fn rotate_image_add(&mut self, delta: f32) {
+        // 反転は回転の後に掛かるので、片方だけ反転中は見た目の回転方向が逆になる。
+        // 押したキーどおりの向きに回るよう、そのときは角度を逆に動かす
+        let delta = if self.flip_h != self.flip_v { -delta } else { delta };
         // 0-360の範囲に収まるように剰余を計算
         self.rotation_angle = (self.rotation_angle + delta).rem_euclid(360.0);
     }
 
-    // 回転された画像をPNGとして上書き保存する
-    fn save_png(&mut self, ctx: &egui::Context) {
+    // 回転・反転の状態が表す変換（左右反転してから回転）
+    fn view_transform(&self) -> rotate_save::Transform {
+        let r = (self.rotation_angle as i32).rem_euclid(360) as u32;
+        rotate_save::Transform::from_view(r, self.flip_h, self.flip_v)
+    }
+
+    // 上書き保存済みの画像を表示中か
+    fn showing_applied(&self) -> bool {
+        matches!((&self.applied_transform, &self.current_file), (Some((p, _)), Some(cur)) if p == cur)
+    }
+
+    // 描画と保存で共通に使う、今の画像に施す変換。
+    // 上書き保存済みの画像なら、ファイルに焼き込んだ分を差し引く
+    fn effective_transform(&self) -> rotate_save::Transform {
+        let view = self.view_transform();
+        match &self.applied_transform {
+            Some((_, applied)) if self.showing_applied() => applied.inverse().then(view),
+            _ => view,
+        }
+    }
+
+    // 回転・反転の状態を (左上に表示するラベル, 新規保存のファイル名に付ける文字列) の列で返す。
+    // 何もしていなければ空
+    fn transform_labels(&self) -> Vec<(String, String)> {
+        let r = (self.rotation_angle as i32).rem_euclid(360);
+        let mut labels = Vec::new();
+        if r != 0 {
+            labels.push((format!("回転: {r}°"), format!("rot{r}")));
+        }
+        if self.flip_h {
+            labels.push(("左右反転".to_string(), "fliph".to_string()));
+        }
+        if self.flip_v {
+            labels.push(("上下反転".to_string(), "flipv".to_string()));
+        }
+        labels
+    }
+
+    // 回転・反転した画像をメタデータを保ったまま保存する。
+    // overwrite が true なら上書き、false なら `元名_rot90.ext` のような別名で新規保存する
+    fn save_rotated_image(&mut self, overwrite: bool, ctx: &egui::Context) {
         let Some(path) = self.current_file.clone() else {
             return;
         };
-        // 拡張子をチェックし、PNGでなければ何もしない
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext != "png" {
-            self.show_key("Save: PNG only");
-            return;
-        }
-        // 回転していないなら書き込まない。
-        // 無変換で save() すると再エンコードになり、元PNGのメタデータ
-        // （テキストチャンク・gAMA など）が失われるため。
-        let angle = (self.rotation_angle as i32).rem_euclid(360);
-        if !matches!(angle, 90 | 180 | 270) {
-            self.show_key("Save: 回転していません");
+        // 回転も反転もしていないなら書き込まない（再エンコードで画質を落とすだけなので）
+        let transform = self.effective_transform();
+        if transform.is_identity() {
+            self.show_key(if self.showing_applied() { "Save: 保存済みです" } else { "Save: 回転・反転していません" });
             return;
         }
         let was_sliding = self.is_sliding;
         if was_sliding {
             self.slide_show(false); // 保存中はスライドショーを一時停止
         }
-        match image::open(&path) {
-            Ok(img) => {
-                // 角度に応じて回転処理
-                let rotated = match angle {
-                    90 => img.rotate90(),
-                    180 => img.rotate180(),
-                    _ => img.rotate270(),
-                };
-                match rotated.save(&path) {
-                    Ok(_) => {
-                        self.rotation_angle = 0.0; // 保存成功後、回転角度をリセット
-                        // ファイルの中身が変わったので、キャッシュ済みテクスチャを捨てて
-                        // 読み直す。これをしないと回転前の画像が表示されたままになる。
-                        // 世代も進めて、保存前に走っていたデコード結果が後から
-                        // 採用されて表示が巻き戻るのを防ぐ。
-                        self.texture_cache.remove(&path);
-                        self.cache_generation = self.cache_generation.wrapping_add(1);
-                        self.current_texture = None;
-                        self.current_image_size = None;
-                        self.load_current_image(ctx);
-                        self.show_key("Saved!");
-                    }
-                    Err(e) => self.show_key(&format!("Save error: {e}")),
-                }
+        let dst = if overwrite {
+            path.clone()
+        } else {
+            // 例: 元名_rot90_fliph.png
+            let parts: Vec<String> = self.transform_labels().into_iter().map(|(_, s)| s).collect();
+            rotate_save::unique_path(&path, &parts.join("_"))
+        };
+        match rotate_save::save_transformed(&path, &dst, transform) {
+            Ok(()) if overwrite => {
+                // 回転・反転の状態はリセットせず次の画像へ引き継ぐ。
+                // この画像はもう変換済みなので、表示中は焼き込んだ分を差し引く
+                self.applied_transform = Some((path.clone(), self.view_transform()));
+                // ファイルの中身が変わったので、キャッシュ済みテクスチャを捨てて
+                // 読み直す。これをしないと回転前の画像が表示されたままになる。
+                // 世代も進めて、保存前に走っていたデコード結果が後から
+                // 採用されて表示が巻き戻るのを防ぐ。
+                self.texture_cache.remove(&path);
+                self.cache_generation = self.cache_generation.wrapping_add(1);
+                self.current_texture = None;
+                self.current_image_size = None;
+                self.load_current_image(ctx);
+                self.show_key("上書き保存しました");
             }
-            Err(e) => self.show_key(&format!("Load error: {e}")),
+            Ok(()) => {
+                // 新しいファイルを一覧に加える。表示は元画像のまま（元ファイルは未変換なので回転・反転も保つ）
+                let dir = self.current_dir.clone();
+                self.init_images(&dir, Some(&path), ctx);
+                let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                self.show_key(&format!("新規保存: {name}"));
+            }
+            Err(e) => self.show_key(&format!("保存エラー: {e}")),
         }
         if was_sliding {
             self.slide_show(true); // スライドショーを再開
@@ -669,6 +723,20 @@ impl App {
                 self.rotate_image(angle);
                 self.show_key(&format!("Rotate {angle}°"));
             }
+            MenuAction::FlipHorizontal => {
+                self.flip_h = !self.flip_h;
+                self.show_key("左右反転");
+            }
+            MenuAction::FlipVertical => {
+                self.flip_v = !self.flip_v;
+                self.show_key("上下反転");
+            }
+            MenuAction::SaveOverwrite => {
+                self.save_rotated_image(true, ctx);
+            }
+            MenuAction::SaveAsNew => {
+                self.save_rotated_image(false, ctx);
+            }
             MenuAction::Reload => {
                 // 何も開いていない状態では current_dir が初期値 "./"（プロセスの
                 // カレントディレクトリ）のままなので、F5 で意図しない場所を開かないよう無視する
@@ -682,8 +750,7 @@ impl App {
             }
             MenuAction::ResizeWindow => {
                 if let Some((w, h)) = self.current_image_size {
-                    let angle_i = (self.rotation_angle as i32).rem_euclid(360);
-                    let (eff_w, eff_h) = if angle_i == 90 || angle_i == 270 {
+                    let (eff_w, eff_h) = if self.effective_transform().swaps_xy() {
                         (h, w)
                     } else {
                         (w, h)
@@ -727,6 +794,8 @@ impl App {
             f: bool,
             o: bool,
             r: bool,
+            x: bool,
+            y: bool,
             f5: bool,
             num1: bool,
             num2: bool,
@@ -763,6 +832,8 @@ impl App {
             f: i.key_pressed(egui::Key::F),
             o: i.key_pressed(egui::Key::O),
             r: i.key_pressed(egui::Key::R),
+            x: i.key_pressed(egui::Key::X),
+            y: i.key_pressed(egui::Key::Y),
             f5: i.key_pressed(egui::Key::F5),
             num1: i.key_pressed(egui::Key::Num1),
             num2: i.key_pressed(egui::Key::Num2),
@@ -806,6 +877,7 @@ impl App {
             // ここは egui が Copy 変換をやめた場合のフォールバック
             if k.c { self.apply_menu_action(MenuAction::CopyFilePath, ctx); }
             if k.d { self.apply_menu_action(MenuAction::CopyFolderPath, ctx); }
+            if k.s { self.apply_menu_action(MenuAction::SaveAsNew, ctx); }
             return; // Ctrl+Shiftショートカットが処理されたら他のキー処理はスキップ
         }
 
@@ -815,7 +887,7 @@ impl App {
             if k.arrow_down  { self.rotate_image(180.0); self.show_key("Rotate 180°"); }
             if k.arrow_left  { self.rotate_image(270.0); self.show_key("Rotate 270°"); }
             if k.arrow_right { self.rotate_image(90.0);  self.show_key("Rotate 90°"); }
-            if k.s           { self.save_png(ctx); }
+            if k.s           { self.apply_menu_action(MenuAction::SaveOverwrite, ctx); }
             // Ctrl+C も上の Copy イベント側で処理される（ここはフォールバック）
             if k.c           { self.apply_menu_action(MenuAction::CopyFile, ctx); }
             if k.o           { self.apply_menu_action(MenuAction::OpenFolder, ctx); }
@@ -854,6 +926,8 @@ impl App {
         if k.num4 { self.rotate_image(270.0); self.show_key("Rotate 270°"); }
         if k.q    { self.rotate_image_add(-90.0); self.show_key("Rotate -90°"); }
         if k.e    { self.rotate_image_add(90.0);  self.show_key("Rotate +90°"); }
+        if k.x    { self.apply_menu_action(MenuAction::FlipHorizontal, ctx); }
+        if k.y    { self.apply_menu_action(MenuAction::FlipVertical, ctx); }
 
         if has_images {
             // Vimライクなキーバインド + 矢印キー
@@ -940,7 +1014,7 @@ impl App {
 
     // Wayland DnD コンテキストを初期化する（Linux のみ）
     #[cfg(target_os = "linux")]
-    fn init_wayland_dnd(&mut self, frame: &eframe::Frame) {
+    fn init_wayland_dnd(&mut self, frame: &eframe::Frame, egui_ctx: &egui::Context) {
         if self.wayland_dnd.is_some() {
             return;
         }
@@ -953,7 +1027,11 @@ impl App {
                 raw_window_handle::RawDisplayHandle::Wayland(d),
             ) => {
                 match WaylandDndContext::new(d.display, w.surface) {
-                    Some(ctx) => { self.wayland_dnd = Some(ctx); }
+                    Some(dnd) => {
+                        let shared = std::sync::Arc::new(std::sync::Mutex::new(dnd));
+                        spawn_wayland_dnd_thread(&shared, egui_ctx.clone());
+                        self.wayland_dnd = Some(shared);
+                    }
                     None => {
                         eprintln!("Wayland DnD の初期化に失敗しました");
                     }
@@ -987,8 +1065,8 @@ impl App {
         let available = available_rect.size();
 
         // 90/270度回転時は、フィット計算のために実質的な幅と高さを入れ替える
-        let angle_i = (self.rotation_angle as i32).rem_euclid(360);
-        let (eff_w, eff_h) = if angle_i == 90 || angle_i == 270 {
+        let transform = self.effective_transform();
+        let (eff_w, eff_h) = if transform.swaps_xy() {
             (tex_size.y, tex_size.x)
         } else {
             (tex_size.x, tex_size.y)
@@ -1004,9 +1082,15 @@ impl App {
         // 逆アスペクト比を渡すと egui 内部で二重縮小が起きて画像が小さくなる
         let display_size = egui::vec2(tex_size.x * scale, tex_size.y * scale);
 
-        // ラジアンに変換してImageウィジェットに設定
-        let angle_rad = self.rotation_angle.to_radians();
+        // 反転込みの変換（左右反転してから回転）のうち、左右反転はテクスチャ座標の反転で表す
+        let angle_rad = (transform.angle as f32).to_radians();
+        let uv = if transform.mirror {
+            egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
+        } else {
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+        };
         let img = egui::Image::new((texture.id(), tex_size))
+            .uv(uv)
             .fit_to_exact_size(display_size)
             .rotate(angle_rad, egui::Vec2::splat(0.5)) // 中央を軸に回転
             .sense(egui::Sense::drag()); // ドラッグ可能にする
@@ -1054,26 +1138,24 @@ impl eframe::App for App {
 
             // Wayland DnD イベントをディスパッチ
             if self.display_server == Some(DisplayServer::Wayland) {
-                self.init_wayland_dnd(frame);
-                if let Some(ref mut wl) = self.wayland_dnd {
-                    wl.dispatch_pending();
-                    wl.complete_pending_drops();
-                    // 送信ドラッグ中、または受信ドラッグ（外部からのオファー受信／ドロップ待ち）中は
-                    // 高頻度で再描画し、accept/set_actions/receive をコンポジターへ遅延なく届ける。
-                    // KWin/KDE は応答が遅いとドロップをタイムアウトさせるため特に重要。
-                    if wl.state.drag_active
-                        || wl.state.current_offer.is_some()
-                        || wl.state.pending_receive.is_some()
-                    {
-                        ctx.request_repaint_after(Duration::from_millis(16));
+                self.init_wayland_dnd(frame, ctx);
+                // 受信したドロップを取り出す。イベントの取り込み自体は監視スレッドが
+                // 常時行っているため、ここではロックを短く保つことだけを考えればよい。
+                let mut drops: Vec<PathBuf> = Vec::new();
+                if let Some(ref wl) = self.wayland_dnd {
+                    if let Ok(mut wl) = wl.lock() {
+                        wl.dispatch_pending();
+                        wl.expire_stale_drag();
+                        wl.complete_pending_drops();
+                        drops.extend(wl.state.received_drops.drain(..));
+                        // 受信データの読み取り中は、パイプの続きを読むために描画を回し続ける
+                        if wl.state.pending_receive.is_some() {
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
                     }
                 }
-                // Wayland DnD 受信で取得したファイルパスを処理
-                if let Some(ref mut wl) = self.wayland_dnd {
-                    let drops: Vec<PathBuf> = wl.state.received_drops.drain(..).collect();
-                    for path in drops {
-                        self.handle_dropped_path(&path, ctx);
-                    }
+                for path in drops {
+                    self.handle_dropped_path(&path, ctx);
                 }
             }
         }
@@ -1229,6 +1311,22 @@ impl eframe::App for App {
                     if item(ui, "画像を90度回転",  "2 / Ctrl+→") { menu_action = Some(MenuAction::Rotate(90.0));  ui.close_menu(); }
                     if item(ui, "画像を180度回転", "3 / Ctrl+↓") { menu_action = Some(MenuAction::Rotate(180.0)); ui.close_menu(); }
                     if item(ui, "画像を270度回転", "4 / Ctrl+←") { menu_action = Some(MenuAction::Rotate(270.0)); ui.close_menu(); }
+                    if item(ui, "左右反転", "X") { menu_action = Some(MenuAction::FlipHorizontal); ui.close_menu(); }
+                    if item(ui, "上下反転", "Y") { menu_action = Some(MenuAction::FlipVertical);   ui.close_menu(); }
+                });
+
+                ui.separator();
+
+                // 回転した画像の保存（画像読込済みのときのみ有効）
+                ui.add_enabled_ui(has_file, |ui| {
+                    if item(ui, "上書き保存", "Ctrl+S") {
+                        menu_action = Some(MenuAction::SaveOverwrite);
+                        ui.close_menu();
+                    }
+                    if item(ui, "新規保存", "Ctrl+Shift+S") {
+                        menu_action = Some(MenuAction::SaveAsNew);
+                        ui.close_menu();
+                    }
                 });
 
                 ui.separator();
@@ -1273,10 +1371,9 @@ impl eframe::App for App {
                         }
                     }
                     Some(DisplayServer::Wayland) => {
-                        if let Some(ref mut wl) = self.wayland_dnd {
-                            wl.start_drag(&path);
-                        } else {
-                            eprintln!("Wayland DnD context not initialized.");
+                        match self.wayland_dnd.as_ref().and_then(|wl| wl.lock().ok()) {
+                            Some(mut wl) => wl.start_drag(&path),
+                            None => eprintln!("Wayland DnD context not initialized."),
                         }
                     }
                     None => {
@@ -1293,6 +1390,30 @@ impl eframe::App for App {
             if let Some(path) = self.current_file.clone() {
                 macos_dnd::begin_file_drag(frame, &path);
             }
+        }
+
+        // 回転・反転オーバーレイ（左上）。回転か反転をしているときだけ表示する
+        let labels = self.transform_labels();
+        if !labels.is_empty() {
+            let mut text = labels.into_iter().map(|(l, _)| l).collect::<Vec<_>>().join(" / ");
+            // 上書き保存した画像は変換済みのファイルをそのまま表示しているので、その旨を添える
+            if self.showing_applied() && self.effective_transform().is_identity() {
+                text.push_str("（この画像は保存済み）");
+            }
+            egui::Area::new(egui::Id::new("rotation_overlay"))
+                .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+                .show(ctx, |ui| {
+                    // 折り返すと「回転:」と角度が2行に分かれるため、1行に固定する
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .size(14.0)
+                                .color(egui::Color32::WHITE)
+                                .background_color(egui::Color32::from_black_alpha(180)),
+                        )
+                        .extend(),
+                    );
+                });
         }
 
         // ファイル名オーバーレイ（左下）
@@ -1324,11 +1445,16 @@ impl eframe::App for App {
             egui::Area::new(egui::Id::new("key_overlay"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -10.0))
                 .show(ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new(text)
-                            .size(14.0)
-                            .color(egui::Color32::WHITE)
-                            .background_color(egui::Color32::from_black_alpha(180)),
+                    // 右端アンカーの Area は利用可能幅が狭く、そのままだと
+                    // 1文字ずつ折り返されて縦書きになるため、折り返しを無効にする
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .size(14.0)
+                                .color(egui::Color32::WHITE)
+                                .background_color(egui::Color32::from_black_alpha(180)),
+                        )
+                        .extend(),
                     );
                 });
         }
@@ -2352,7 +2478,12 @@ struct WaylandDndState {
     shm: Option<wl_shm::WlShm>,                     // カーソルテーマ読み込み用
     drag_uri: Option<String>,   // ドラッグ中のファイルURI
     drag_active: bool,          // ドラッグ操作中かどうか
+    drag_source: Option<wl_data_source::WlDataSource>, // ドラッグ中のデータソース
     drag_icon_surface: Option<wl_surface::WlSurface>, // ドラッグ中のアイコンサーフェス
+    // ドラッグ開始後にポインタのボタン解放を観測した時刻。
+    // DnD grab が成立するとコンポジターは wl_pointer のイベント送出を止めるため、
+    // ここに時刻が入る＝start_drag が受理されなかった可能性が高い
+    drag_release_at: Option<Instant>,
     // DnD 受信用の状態（winit が Wayland DnD 受信を未実装のため自前で処理）
     current_offer: Option<wl_data_offer::WlDataOffer>, // 現在のドラッグオファー
     offer_has_uri_list: bool,   // オファーが text/uri-list を含むか
@@ -2361,6 +2492,8 @@ struct WaylandDndState {
     // （KWin/KDE は DnD v3 の手順を厳格に検証するため、転送前の finish/destroy でドロップが失敗する）
     pending_receive: Option<PendingReceive>,
     received_drops: Vec<PathBuf>, // 受信完了したドロップファイルパス
+    // DnD 関連のイベントを処理した回数。監視スレッドが「描画を促すべきか」の判定に使う
+    dnd_event_seq: u64,
 }
 
 /// 進行中のドロップデータ受信。
@@ -2377,6 +2510,61 @@ struct PendingReceive {
 /// ドロップデータ受信を諦めるまでの上限時間
 #[cfg(target_os = "linux")]
 const DROP_RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 受理されなかった start_drag を諦めるまでの時間
+#[cfg(target_os = "linux")]
+const STALE_DRAG_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// RVIEW_DND_DEBUG が設定されていれば DnD の診断ログを出す
+#[cfg(target_os = "linux")]
+fn dnd_debug() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RVIEW_DND_DEBUG").is_some())
+}
+
+/// DnD コンテキストを監視スレッドと共有するためのハンドル
+#[cfg(target_os = "linux")]
+type SharedWaylandDnd = std::sync::Arc<std::sync::Mutex<WaylandDndContext>>;
+
+/// 監視スレッドがキューを処理する間隔
+#[cfg(target_os = "linux")]
+const DND_DISPATCH_INTERVAL: Duration = Duration::from_millis(4);
+
+/// DnD イベントに即応するための監視スレッドを起動する。
+///
+/// wl_data_device の enter に accept を返すのが遅れると、コンポジターは
+/// 「ドロップを受け付けないクライアント」とみなし、ドロップ時に drop ではなく
+/// leave を送ってくる（＝ドロップが取りこぼされる）。GNOME/mutter では enter から
+/// 30ms 程度で打ち切られるため、描画フレーム（VSync 待ち）に任せていると間に合わない。
+///
+/// しかも DnD の最中はコンポジターが wl_pointer のイベント送出を止めるため、
+/// winit から見ると入力が何も来ない状態になり、再描画も update() も走らない。
+/// そこで描画とは切り離してキューを処理する。
+///
+/// ソケットの読み取りは winit に任せ、ここでは既に積まれたイベントを処理するだけに留める。
+/// 自前で読んでしまうと winit がイベントを取りこぼし、入力が効かなくなるため。
+#[cfg(target_os = "linux")]
+fn spawn_wayland_dnd_thread(shared: &SharedWaylandDnd, egui_ctx: egui::Context) {
+    let weak = std::sync::Arc::downgrade(shared);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(DND_DISPATCH_INTERVAL);
+        // アプリ側が手放したらスレッドも終了する
+        let Some(shared) = weak.upgrade() else { return };
+        let Ok(mut wl) = shared.lock() else { return };
+        let before = wl.state.dnd_event_seq;
+        wl.dispatch_queued();
+        wl.complete_pending_drops();
+        let handled = wl.state.dnd_event_seq != before;
+        let has_drops = !wl.state.received_drops.is_empty();
+        drop(wl);
+        // 受信したファイルの反映は update() 側で行うので描画を促す。
+        // DnD イベントを処理したときも、winit を起こしてフレームを回してもらう。
+        if handled || has_drops {
+            egui_ctx.request_repaint();
+        }
+    });
+}
 
 /// Wayland DnD コンテキスト
 #[cfg(target_os = "linux")]
@@ -2411,11 +2599,14 @@ impl WaylandDndContext {
             shm: None,
             drag_uri: None,
             drag_active: false,
+            drag_source: None,
             drag_icon_surface: None,
+            drag_release_at: None,
             current_offer: None,
             offer_has_uri_list: false,
             pending_receive: None,
             received_drops: Vec::new(),
+            dnd_event_seq: 0,
         };
 
         let mut event_queue = conn.new_event_queue();
@@ -2460,6 +2651,14 @@ impl WaylandDndContext {
             origin_surface,
             cursor_theme: None,
         })
+    }
+
+    /// 既にキューへ積まれているイベントだけを処理する（ソケットからは読まない）。
+    /// 監視スレッドから呼ぶ用。読み取りまで行うと winit がイベントを取りこぼす。
+    fn dispatch_queued(&mut self) {
+        let _ = self.event_queue.dispatch_pending(&mut self.state);
+        // ディスパッチ中に送出した accept / set_actions / receive を即座に届ける
+        let _ = self.conn.flush();
     }
 
     /// 保留中のイベントをディスパッチする
@@ -2548,6 +2747,17 @@ impl WaylandDndContext {
             return;
         }
 
+        // 直前のイベントを取り込んで押下シリアルを最新にする。
+        // start_drag のシリアルが現在の implicit grab のものと一致しないと、
+        // コンポジターはエラーも返さずに要求を捨てる（ドラッグが始まらない）。
+        self.dispatch_pending();
+
+        // 前回のドラッグの残骸を確実に片付ける。
+        // 無視された start_drag には cancelled も dnd_finished も返ってこないため、
+        // これがないと drag_active が true のまま固着し、以後の受信ドロップまで
+        // 全て無視されるようになる（wl_data_device の Enter/Drop が自分のドラッグと誤認する）。
+        self.reset_drag_state();
+
         // ファイル URI を生成
         let uri_str = url::Url::from_file_path(file_path)
             .map(|u| u.to_string())
@@ -2562,8 +2772,10 @@ impl WaylandDndContext {
         let mgr = self.state.data_device_manager.as_ref().unwrap();
         let source = mgr.create_data_source(&qh, ());
         source.offer("text/uri-list".to_string());
-        // サポートするアクションを宣言（これがないとコンポジターがアクション交渉できずドロップが失敗する）
-        source.set_actions(wl_data_device_manager::DndAction::Copy | wl_data_device_manager::DndAction::Move);
+        // サポートするアクションを宣言（これがないとコンポジターがアクション交渉できずドロップが失敗する）。
+        // Move は宣言しない：受け手が Move を選ぶと元ファイルの削除はドラッグ元の責務になるが、
+        // 画像ビューワが勝手にファイルを消すべきではないため Copy のみを提供する。
+        source.set_actions(wl_data_device_manager::DndAction::Copy);
 
         // ドラッグを開始
         let device = self.state.data_device.as_ref().unwrap();
@@ -2575,8 +2787,51 @@ impl WaylandDndContext {
         );
 
         self.state.drag_icon_surface = icon_surface;
+        self.state.drag_source = Some(source);
         self.state.drag_active = true;
+        self.state.drag_release_at = None;
         let _ = self.conn.flush();
+        if dnd_debug() {
+            eprintln!(
+                "[rview-dnd] start_drag serial={} icon={}",
+                self.state.last_button_serial,
+                self.state.drag_icon_surface.is_some()
+            );
+        }
+    }
+
+    /// ドラッグ送出の状態をすべて初期化する（アイコンとデータソースも破棄する）
+    fn reset_drag_state(&mut self) {
+        self.state.drag_active = false;
+        self.state.drag_release_at = None;
+        self.state.drag_uri = None;
+        if let Some(icon) = self.state.drag_icon_surface.take() {
+            icon.destroy();
+        }
+        if let Some(source) = self.state.drag_source.take() {
+            source.destroy();
+        }
+    }
+
+    /// 受理されなかった start_drag の後始末をする。
+    ///
+    /// 無効なシリアルを渡した start_drag は、コンポジターにエラーも返されず黙って捨てられる。
+    /// その場合 DnD grab は成立しないので通常どおり wl_pointer のボタン解放イベントが届く。
+    /// これを検出したらドラッグ状態を解除しないと、drag_active が true のまま固着して
+    /// 以後のドロップ受信が全て無視されてしまう。
+    fn expire_stale_drag(&mut self) {
+        let Some(released_at) = self.state.drag_release_at else { return };
+        // 開始要求と行き違いで届いた解放イベントを誤検出しないよう少し待つ
+        if released_at.elapsed() < STALE_DRAG_TIMEOUT {
+            return;
+        }
+        if dnd_debug() {
+            eprintln!(
+                "[rview-dnd] start_drag が受理されませんでした（シリアル {} は無効）",
+                self.state.last_button_serial
+            );
+        }
+        self.reset_drag_state();
     }
 
     /// カーソルテーマを初期化する（まだ読み込まれていない場合のみ）
@@ -2696,8 +2951,19 @@ impl WlDispatch<wl_pointer::WlPointer, ()> for WaylandDndState {
     ) {
         // start_drag には押下時のシリアルが必要（解放時のシリアルでは無効）
         if let wl_pointer::Event::Button { serial, state: btn_state, .. } = event {
-            if btn_state == wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) {
-                state.last_button_serial = serial;
+            match btn_state {
+                wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                    state.last_button_serial = serial;
+                }
+                wayland_client::WEnum::Value(wl_pointer::ButtonState::Released) => {
+                    // ドラッグ中にここへ来るのは異常。DnD grab が成立していれば
+                    // コンポジターは wl_pointer のイベントを送ってこないため、
+                    // start_drag が黙って無視された可能性が高い（expire_stale_drag が後始末する）
+                    if state.drag_active && state.drag_release_at.is_none() {
+                        state.drag_release_at = Some(Instant::now());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2728,6 +2994,7 @@ impl WlDispatch<wl_data_device::WlDataDevice, ()> for WaylandDndState {
         _conn: &WlConnection,
         _qh: &WlQueueHandle<Self>,
     ) {
+        state.dnd_event_seq = state.dnd_event_seq.wrapping_add(1);
         match event {
             wl_data_device::Event::DataOffer { id } => {
                 // 新しいオファーオブジェクトが作成された。MIME タイプの追跡を開始
@@ -2736,6 +3003,12 @@ impl WlDispatch<wl_data_device::WlDataDevice, ()> for WaylandDndState {
             }
             wl_data_device::Event::Enter { serial, id, .. } => {
                 // DnD カーソルがサーフェスに入った
+                if dnd_debug() {
+                    eprintln!(
+                        "[rview-dnd] enter uri_list={} self_drag={}",
+                        state.offer_has_uri_list, state.drag_active
+                    );
+                }
                 if state.drag_active {
                     return; // 自分自身のドラッグは無視
                 }
@@ -2755,6 +3028,12 @@ impl WlDispatch<wl_data_device::WlDataDevice, ()> for WaylandDndState {
             }
             wl_data_device::Event::Drop => {
                 // ユーザーがドロップした → パイプ経由でデータを受信する
+                if dnd_debug() {
+                    eprintln!(
+                        "[rview-dnd] drop uri_list={} self_drag={}",
+                        state.offer_has_uri_list, state.drag_active
+                    );
+                }
                 if let Some(offer) = state.current_offer.take() {
                     // 自分が始めたドラッグを自分のウィンドウに落とした場合は受信しない
                     // （Enter と同じガード。これがないと自分自身を読み直してしまう）
@@ -2813,6 +3092,7 @@ impl WlDispatch<wl_data_source::WlDataSource, ()> for WaylandDndState {
         _conn: &WlConnection,
         _qh: &WlQueueHandle<Self>,
     ) {
+        state.dnd_event_seq = state.dnd_event_seq.wrapping_add(1);
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
                 // ドロップターゲットがデータを要求した → URI を fd に書き込む
@@ -2825,6 +3105,8 @@ impl WlDispatch<wl_data_source::WlDataSource, ()> for WaylandDndState {
                 }
             }
             wl_data_source::Event::DndDropPerformed => {
+                // grab が成立していた証拠なので、失敗検出用の記録は取り消す
+                state.drag_release_at = None;
                 // ドロップ操作そのものは完了した。
                 // dnd_finished は wl_data_device_manager v3 以上かつ受け手が finish() を
                 // 呼んだ場合にしか届かないため、ここでもドラッグ状態を解除しておかないと
@@ -2836,20 +3118,18 @@ impl WlDispatch<wl_data_source::WlDataSource, ()> for WaylandDndState {
                 // データ転送要求（Send）がこの後に来る可能性があるため
                 // drag_uri と source はここでは破棄しない
             }
-            wl_data_source::Event::DndFinished => {
-                // ドロップ完了
-                state.drag_active = false;
-                state.drag_uri = None;
-                source.destroy();
-                if let Some(icon) = state.drag_icon_surface.take() {
-                    icon.destroy();
+            wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled => {
+                // ドロップ完了、またはドラッグのキャンセル
+                if dnd_debug() {
+                    eprintln!("[rview-dnd] drag finished/cancelled");
                 }
-            }
-            wl_data_source::Event::Cancelled => {
-                // ドラッグキャンセル
                 state.drag_active = false;
+                state.drag_release_at = None;
                 state.drag_uri = None;
-                source.destroy();
+                match state.drag_source.take() {
+                    Some(owned) => owned.destroy(),
+                    None => source.destroy(),
+                }
                 if let Some(icon) = state.drag_icon_surface.take() {
                     icon.destroy();
                 }
