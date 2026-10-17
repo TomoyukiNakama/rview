@@ -4,11 +4,15 @@
 //! メタデータは元ファイルからバイト列のまま引き継ぐ。回転が画素に焼き込まれるので、
 //! EXIF の Orientation は 1（回転なし）に直す。そのままだと Orientation を解釈する
 //! ビューアで二重に回転してしまう。
+//!
+//! 回転・反転と同時に画像サイズの変更（拡大縮小）もできる。拡大縮小は回転の前に、
+//! 元画像の向きで行う。
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, ImageFormat};
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView, ImageFormat};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -76,23 +80,33 @@ impl Transform {
     }
 }
 
-/// `src` に変換 `t` を施して `dst` に保存する。
+/// `src` を（`resize` の指定があれば）その大きさに拡大縮小し、変換 `t` を施して `dst` に保存する。
+/// `resize` は変換前（元画像の向き）での (幅, 高さ)。
 /// `src == dst` なら上書き保存になる。一時ファイルに書いてから rename するので、
 /// 途中で失敗しても元ファイルは壊れない。
-pub fn save_transformed(src: &Path, dst: &Path, t: Transform) -> Result<()> {
+pub fn save_transformed(src: &Path, dst: &Path, t: Transform, resize: Option<(u32, u32)>) -> Result<()> {
     if !matches!(t.angle, 0 | 90 | 180 | 270) {
         return Err(format!("未対応の角度です: {}", t.angle));
     }
-    if t.angle == 0 && !t.mirror {
-        return Err("回転・反転していません".into());
+    if t.is_identity() && resize.is_none() {
+        return Err("回転・反転・サイズ変更をしていません".into());
+    }
+    if resize.is_some_and(|(w, h)| w == 0 || h == 0) {
+        return Err("幅と高さは 1 以上にしてください".into());
     }
     let data = std::fs::read(src).map_err(|e| format!("読み込みエラー: {e}"))?;
-    let out = transform_bytes(&data, t)?;
+    let out = transform_bytes(&data, t, resize)?;
     write_atomic(src, dst, &out)
 }
 
 /// 新規保存用の保存先パスを作る（`元名_<suffix>.ext`、既存なら `元名_<suffix>_1.ext` …）
+#[cfg(test)]
 pub fn unique_path(src: &Path, suffix: &str) -> PathBuf {
+    unique_path_excluding(src, suffix, |_| false)
+}
+
+/// `unique_path` と同じだが、`reserved` が true を返すパス（これから書き込む予定のパスなど）も避ける
+pub fn unique_path_excluding(src: &Path, suffix: &str, reserved: impl Fn(&Path) -> bool) -> PathBuf {
     let dir = src.parent().unwrap_or(Path::new("."));
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
     let ext = src.extension().and_then(|e| e.to_str());
@@ -103,32 +117,33 @@ pub fn unique_path(src: &Path, suffix: &str) -> PathBuf {
         };
         dir.join(name)
     };
+    let free = |p: &PathBuf| !p.exists() && !reserved(p);
     let first = make(String::new());
-    if !first.exists() {
+    if free(&first) {
         return first;
     }
     (1..)
         .map(|n| make(format!("_{n}")))
-        .find(|p| !p.exists())
+        .find(free)
         .unwrap() // 無限イテレータなので必ず見つかる
 }
 
 /// ファイルの中身（バイト列）を変換し、同じ形式のバイト列を返す
-fn transform_bytes(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn transform_bytes(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        rotate_png(data, t)
+        rotate_png(data, t, resize)
     } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        rotate_jpeg(data, t)
+        rotate_jpeg(data, t, resize)
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        rotate_gif(data, t)
+        rotate_gif(data, t, resize)
     } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        rotate_webp(data, t)
+        rotate_webp(data, t, resize)
     } else if data.starts_with(b"II*\0") || data.starts_with(b"MM\0*") {
-        rotate_tiff(data, t)
+        rotate_tiff(data, t, resize)
     } else if data.starts_with(b"II+\0") || data.starts_with(b"MM\0+") {
         Err("BigTIFF は保存に未対応です".into())
     } else if data.starts_with(b"BM") {
-        rotate_bmp(data, t)
+        rotate_bmp(data, t, resize)
     } else {
         Err("保存に未対応の形式です".into())
     }
@@ -167,6 +182,16 @@ fn rotate_image(img: &DynamicImage, t: Transform) -> DynamicImage {
         180 => img.rotate180(),
         270 => img.rotate270(),
         _ => img.clone(),
+    }
+}
+
+/// （`resize` の指定があれば）その大きさに拡大縮小してから変換 `t` を施す
+fn edit_image(img: &DynamicImage, t: Transform, resize: Option<(u32, u32)>) -> DynamicImage {
+    match resize {
+        Some((w, h)) if (w, h) != img.dimensions() => {
+            rotate_image(&img.resize_exact(w, h, FilterType::Lanczos3), t)
+        }
+        _ => rotate_image(img, t),
     }
 }
 
@@ -230,13 +255,13 @@ fn png_chunk_bytes(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rotate_png(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn rotate_png(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     let orig = png_chunks(data)?;
     if orig.iter().any(|c| &c.kind == b"acTL") {
         return Err("アニメーション PNG は保存に未対応です".into());
     }
     let img = decode(data, ImageFormat::Png)?;
-    let encoded = encode(&rotate_image(&img, t), ImageFormat::Png)?;
+    let encoded = encode(&edit_image(&img, t, resize), ImageFormat::Png)?;
     let new = png_chunks(&encoded)?;
 
     // IHDR の色形式（ビット深度・カラータイプ）が変わらなければ、
@@ -281,7 +306,7 @@ fn rotate_png(data: &[u8], t: Transform) -> Result<Vec<u8>> {
             }
             b"eXIf" => {
                 let mut d = c.data.to_vec();
-                patch_exif_tiff(&mut d, swap_xy);
+                patch_exif_tiff(&mut d, swap_xy, resize);
                 out.extend(png_chunk_bytes(&c.kind, &d));
             }
             _ => out.extend_from_slice(c.raw),
@@ -293,7 +318,7 @@ fn rotate_png(data: &[u8], t: Transform) -> Result<Vec<u8>> {
 
 // ───────────────────────────── JPEG ─────────────────────────────
 
-fn rotate_jpeg(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn rotate_jpeg(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     // SOS までのマーカーセグメントを走査し、APPn / COM を集める
     let mut meta: Vec<Vec<u8>> = Vec::new();
     let mut components = 3u8;
@@ -335,7 +360,7 @@ fn rotate_jpeg(data: &[u8], t: Transform) -> Result<Vec<u8>> {
     let swap_xy = t.swaps_xy();
     for seg in &mut meta {
         if seg[1] == 0xE1 && seg[4..].starts_with(b"Exif\0\0") {
-            patch_exif_tiff(&mut seg[10..], swap_xy);
+            patch_exif_tiff(&mut seg[10..], swap_xy, resize);
         }
         // JFIF の画素密度（X: 12..14、Y: 14..16）も縦横を入れ替える
         if swap_xy && seg[1] == 0xE0 && seg[4..].starts_with(b"JFIF\0") && seg.len() >= 16 {
@@ -349,7 +374,7 @@ fn rotate_jpeg(data: &[u8], t: Transform) -> Result<Vec<u8>> {
     }
 
     let img = decode(data, ImageFormat::Jpeg)?;
-    let rotated = rotate_image(&img, t);
+    let rotated = edit_image(&img, t, resize);
     let rotated = match rotated {
         DynamicImage::ImageLuma8(_) | DynamicImage::ImageRgb8(_) => rotated,
         other => DynamicImage::ImageRgb8(other.to_rgb8()),
@@ -398,6 +423,10 @@ impl Endian {
         let bytes = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
         b[..2].copy_from_slice(&bytes);
     }
+    fn put_u32(self, b: &mut [u8], v: u32) {
+        let bytes = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        b[..4].copy_from_slice(&bytes);
+    }
 }
 
 fn tiff_endian(tiff: &[u8]) -> Option<Endian> {
@@ -411,11 +440,12 @@ fn tiff_endian(tiff: &[u8]) -> Option<Endian> {
 /// 埋め込み EXIF（TIFF 構造）をその場で書き換える。長さを変えないので、
 /// MakerNote などの内部オフセットが壊れない。
 /// - IFD0 の Orientation を 1 にする
+/// - `resize`（変換前の向きでの新しい大きさ）があれば ExifIFD の PixelXDimension / PixelYDimension を書き換える
 /// - `swap_xy` なら ExifIFD の PixelXDimension / PixelYDimension と
 ///   IFD0 の XResolution / YResolution を入れ替える
 ///
 /// 構造が読めない EXIF は何もしない（壊すよりはそのまま残す）
-fn patch_exif_tiff(tiff: &mut [u8], swap_xy: bool) {
+fn patch_exif_tiff(tiff: &mut [u8], swap_xy: bool, resize: Option<(u32, u32)>) {
     let Some(e) = tiff_endian(tiff) else { return };
     if tiff.len() < 8 {
         return;
@@ -439,6 +469,15 @@ fn patch_exif_tiff(tiff: &mut [u8], swap_xy: bool) {
             e.put_u16(&mut tiff[p + 8..], 1);
         }
     }
+    let exif_entries = find(&ifd0_entries, TAG_EXIF_IFD)
+        .map(|p| entries(tiff, e.u32(&tiff[p + 8..]) as usize))
+        .unwrap_or_default();
+    let pixel_dims =
+        (find(&exif_entries, TAG_PIXEL_X_DIMENSION), find(&exif_entries, TAG_PIXEL_Y_DIMENSION));
+    if let (Some((w, h)), (Some(px), Some(py))) = (resize, pixel_dims) {
+        put_dimension(tiff, e, px, w);
+        put_dimension(tiff, e, py, h);
+    }
     if !swap_xy {
         return;
     }
@@ -449,16 +488,23 @@ fn patch_exif_tiff(tiff: &mut [u8], swap_xy: bool) {
     {
         swap_entry_values(tiff, px, py);
     }
-    if let Some(p) = find(&ifd0_entries, TAG_EXIF_IFD) {
-        let exif_ifd = e.u32(&tiff[p + 8..]) as usize;
-        let exif_entries = entries(tiff, exif_ifd);
-        if let (Some(px), Some(py)) = (
-            find(&exif_entries, TAG_PIXEL_X_DIMENSION),
-            find(&exif_entries, TAG_PIXEL_Y_DIMENSION),
-        ) {
-            // SHORT / LONG が混在しても型ごと入れ替えれば正しい
-            swap_entry_values(tiff, px, py);
+    if let (Some(px), Some(py)) = pixel_dims {
+        // SHORT / LONG が混在しても型ごと入れ替えれば正しい
+        swap_entry_values(tiff, px, py);
+    }
+}
+
+/// エントリ先頭 `p` の PixelX/YDimension（SHORT / LONG 1 個）の値をその場で書き換える。
+/// SHORT に収まらない値は長さを変えないと書けないので、そのまま残す
+fn put_dimension(tiff: &mut [u8], e: Endian, p: usize, v: u32) {
+    match e.u16(&tiff[p + 2..]) {
+        3 => {
+            if let Ok(v) = u16::try_from(v) {
+                e.put_u16(&mut tiff[p + 8..], v);
+            }
         }
+        4 => e.put_u32(&mut tiff[p + 8..], v),
+        _ => {}
     }
 }
 
@@ -597,7 +643,7 @@ fn entry_u32s(ent: &IfdEntry) -> Vec<u32> {
 
 // ───────────────────────────── TIFF ─────────────────────────────
 
-fn rotate_tiff(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn rotate_tiff(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     let e = tiff_endian(data).ok_or("TIFF のヘッダが壊れています")?;
     let (mut orig, next) = read_ifd(data, e, e.u32(&data[4..]) as usize, 0)?;
     if next != 0 {
@@ -609,7 +655,7 @@ fn rotate_tiff(data: &[u8], t: Transform) -> Result<Vec<u8>> {
 
     // 画素は image で回転・エンコードし、その結果の IFD から画像構造のタグと画素データを取る
     let img = decode(data, ImageFormat::Tiff)?;
-    let rotated = rotate_image(&img, t);
+    let rotated = edit_image(&img, t, resize);
     let compression = orig
         .iter()
         .find(|t| t.tag == TAG_COMPRESSION)
@@ -646,6 +692,15 @@ fn rotate_tiff(data: &[u8], t: Transform) -> Result<Vec<u8>> {
         if t.tag == TAG_ORIENTATION && t.typ == 3 {
             t.data = 1u16.to_le_bytes().to_vec();
         }
+        if let (Some((w, h)), TAG_EXIF_IFD) = (resize, t.tag) {
+            for s in t.sub.iter_mut().flatten() {
+                match s.tag {
+                    TAG_PIXEL_X_DIMENSION => set_dimension_entry(s, w),
+                    TAG_PIXEL_Y_DIMENSION => set_dimension_entry(s, h),
+                    _ => {}
+                }
+            }
+        }
         if swap_xy {
             t.tag = match t.tag {
                 TAG_X_RESOLUTION => TAG_Y_RESOLUTION,
@@ -672,6 +727,22 @@ fn rotate_tiff(data: &[u8], t: Transform) -> Result<Vec<u8>> {
     }
 
     assemble_tiff(&encoded, &new, entries)
+}
+
+/// PixelX/YDimension（SHORT / LONG 1 個、リトルエンディアン）の値を書き換える
+fn set_dimension_entry(ent: &mut IfdEntry, v: u32) {
+    match ent.typ {
+        3 => match u16::try_from(v) {
+            Ok(v) => ent.data = v.to_le_bytes().to_vec(),
+            // SHORT に収まらなければ LONG にする
+            Err(_) => {
+                ent.typ = 4;
+                ent.data = v.to_le_bytes().to_vec();
+            }
+        },
+        4 => ent.data = v.to_le_bytes().to_vec(),
+        _ => {}
+    }
 }
 
 /// 画像を TIFF にエンコードする。圧縮方式は元ファイルの Compression タグに合わせる
@@ -737,7 +808,7 @@ fn assemble_tiff(encoded: &[u8], encoded_ifd: &[IfdEntry], mut entries: Vec<IfdE
 
 // ───────────────────────────── WebP ─────────────────────────────
 
-fn rotate_webp(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn rotate_webp(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     let mut icc = Vec::new();
     let mut exif = Vec::new();
     let mut xmp = Vec::new();
@@ -758,11 +829,11 @@ fn rotate_webp(data: &[u8], t: Transform) -> Result<Vec<u8>> {
     if !exif.is_empty() {
         // "Exif\0\0" が前置されている書き出し元もある
         let start = if exif.starts_with(b"Exif\0\0") { 6 } else { 0 };
-        patch_exif_tiff(&mut exif[start..], t.swaps_xy());
+        patch_exif_tiff(&mut exif[start..], t.swaps_xy(), resize);
     }
 
     let img = decode(data, ImageFormat::WebP)?;
-    let rotated = rotate_image(&img, t);
+    let rotated = edit_image(&img, t, resize);
     let (buf, color) = if rotated.color().has_alpha() {
         (rotated.to_rgba8().into_raw(), image_webp::ColorType::Rgba8)
     } else {
@@ -857,21 +928,73 @@ fn gif_extensions(data: &[u8]) -> Vec<(u8, Vec<Vec<u8>>)> {
     found
 }
 
-fn rotate_gif(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+/// 論理画面 `from` 上のフレーム（左上 `pos`、大きさ `size`、1 バイト 1 画素）を、
+/// 論理画面が `to` の大きさになるように拡大縮小する。
+/// パレットインデックスは補間できないので最近傍法を使う。戻り値は (画素, 左上, 大きさ)
+fn scale_gif_frame(
+    buf: &[u8],
+    pos: (i32, i32),
+    size: (i32, i32),
+    from: (i32, i32),
+    to: (i32, i32),
+) -> (Vec<u8>, (i32, i32), (i32, i32)) {
+    if from == to {
+        return (buf.to_vec(), pos, size);
+    }
+    let scale = |v: i32, f: i32, t: i32| ((v as i64 * t as i64 + f as i64 / 2) / f as i64) as i32;
+    if size.0 <= 0 || size.1 <= 0 {
+        return (Vec::new(), (scale(pos.0, from.0, to.0), scale(pos.1, from.1, to.1)), (0, 0));
+    }
+    // 1 軸ぶん: 新しい開始位置と、新しい各画素が参照する元フレーム内の座標
+    let axis = |p: i32, len: i32, f: i32, t: i32| -> (i32, Vec<usize>) {
+        let n0 = scale(p, f, t).min(t - 1);
+        let n1 = scale(p + len, f, t).clamp(n0 + 1, t);
+        let src = (n0..n1)
+            .map(|n| {
+                // 新しい画素の中心が元の論理画面のどこに当たるか
+                let s = ((2 * n as i64 + 1) * f as i64 / (2 * t as i64)) as i32 - p;
+                s.clamp(0, len - 1) as usize
+            })
+            .collect();
+        (n0, src)
+    };
+    let (x0, xs) = axis(pos.0, size.0, from.0, to.0);
+    let (y0, ys) = axis(pos.1, size.1, from.1, to.1);
+    let w = size.0 as usize;
+    let out = ys.iter().flat_map(|&sy| xs.iter().map(move |&sx| buf[sy * w + sx])).collect();
+    (out, (x0, y0), (xs.len() as i32, ys.len() as i32))
+}
+
+fn rotate_gif(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     let err = |e: gif::DecodingError| format!("デコードエラー: {e}");
     let mut opts = gif::DecodeOptions::new();
     opts.set_color_output(gif::ColorOutput::Indexed);
     let mut dec = opts.read_info(Cursor::new(data)).map_err(err)?;
-    let (sw, sh) = (dec.width() as i32, dec.height() as i32);
+    let orig_size = (dec.width() as i32, dec.height() as i32);
+    // 拡大縮小後の論理画面の大きさ
+    let (sw, sh) = match resize {
+        Some((w, h)) => {
+            if w > u16::MAX as u32 || h > u16::MAX as u32 {
+                return Err(format!("GIF の幅と高さは {} 以下にしてください", u16::MAX));
+            }
+            (w as i32, h as i32)
+        }
+        None => orig_size,
+    };
     let global_palette = dec.global_palette().map(<[u8]>::to_vec).unwrap_or_default();
     let (nw, nh) = if t.swaps_xy() { (sh, sw) } else { (sw, sh) };
 
     let mut frames = Vec::new();
     while let Some(frame) = dec.read_next_frame().map_err(err)? {
-        let (w, h) = (frame.width as i32, frame.height as i32);
+        let (buf, (left, top), (w, h)) = scale_gif_frame(
+            &frame.buffer,
+            (frame.left as i32, frame.top as i32),
+            (frame.width as i32, frame.height as i32),
+            orig_size,
+            (sw, sh),
+        );
         // フレームの位置を論理画面上で変換する（左右反転 → 回転）
-        let l = if t.mirror { sw - frame.left as i32 - w } else { frame.left as i32 };
-        let top = frame.top as i32;
+        let l = if t.mirror { sw - left - w } else { left };
         let (nl, nt) = match t.angle {
             90 => (sh - top - h, l),
             180 => (sw - l - w, sh - top - h),
@@ -881,7 +1004,7 @@ fn rotate_gif(data: &[u8], t: Transform) -> Result<Vec<u8>> {
         let (fw, fh) = if t.swaps_xy() { (h, w) } else { (w, h) };
         let mut f = frame.clone();
         // デコーダはインターレースを解いた順で返すので、書き出しも非インターレースにする
-        f.buffer = rotate_indices(&frame.buffer, w as usize, h as usize, t).into();
+        f.buffer = rotate_indices(&buf, w as usize, h as usize, t).into();
         f.left = nl.max(0) as u16;
         f.top = nt.max(0) as u16;
         f.width = fw as u16;
@@ -917,10 +1040,10 @@ fn rotate_gif(data: &[u8], t: Transform) -> Result<Vec<u8>> {
 
 // ───────────────────────────── BMP ─────────────────────────────
 
-fn rotate_bmp(data: &[u8], t: Transform) -> Result<Vec<u8>> {
+fn rotate_bmp(data: &[u8], t: Transform, resize: Option<(u32, u32)>) -> Result<Vec<u8>> {
     // BMP のメタデータは解像度くらいなので、回転して再エンコードし、解像度だけ引き継ぐ
     let img = decode(data, ImageFormat::Bmp)?;
-    let mut out = encode(&rotate_image(&img, t), ImageFormat::Bmp)?;
+    let mut out = encode(&edit_image(&img, t, resize), ImageFormat::Bmp)?;
     // BITMAPINFOHEADER 以降（ヘッダ長 40 以上）なら 38..42 が X、42..46 が Y の画素密度 (pixels/m)
     let has_resolution = |b: &[u8]| b.len() >= 46 && le32(&b[14..]) >= 40;
     if has_resolution(data) && has_resolution(&out) {
@@ -1006,10 +1129,10 @@ mod tests {
     #[test]
     fn exif_patch_resets_orientation_and_swaps_dimensions() {
         let mut exif = exif_blob();
-        patch_exif_tiff(&mut exif, true);
+        patch_exif_tiff(&mut exif, true, None);
         assert_eq!(read_exif(&exif), (1, 300, 72, 2, 3));
         let mut exif = exif_blob();
-        patch_exif_tiff(&mut exif, false);
+        patch_exif_tiff(&mut exif, false, None);
         assert_eq!(read_exif(&exif), (1, 72, 300, 3, 2));
     }
 
@@ -1033,7 +1156,7 @@ mod tests {
             src.extend_from_slice(c.raw);
         }
 
-        let out = rotate_png(&src, R90).unwrap();
+        let out = rotate_png(&src, R90, None).unwrap();
         assert_rotated(&out, ImageFormat::Png);
         let kinds: Vec<_> = png_chunks(&out).unwrap().iter().map(|c| c.kind).collect();
         let pos = |k: &[u8; 4]| kinds.iter().position(|x| x == k).unwrap();
@@ -1054,7 +1177,7 @@ mod tests {
         let mut src = base[..33].to_vec(); // シグネチャ + IHDR
         src.extend(png_chunk_bytes(b"acTL", &[0, 0, 0, 1, 0, 0, 0, 0]));
         src.extend_from_slice(&base[33..]);
-        assert!(rotate_png(&src, R90).is_err());
+        assert!(rotate_png(&src, R90, None).is_err());
     }
 
     #[test]
@@ -1075,7 +1198,7 @@ mod tests {
         src.extend(segment(0xEE, b"Adobe\0\x64\0\0\0\0\0"));
         src.extend_from_slice(&base[2..]);
 
-        let out = rotate_jpeg(&src, R90).unwrap();
+        let out = rotate_jpeg(&src, R90, None).unwrap();
         assert_rotated(&out, ImageFormat::Jpeg);
         assert_eq!(&out[2..4], &[0xFF, 0xE1], "EXIF は SOI の直後");
         let exif_len = be16(&out[4..]) as usize;
@@ -1105,7 +1228,7 @@ mod tests {
             }
         }
 
-        let out = rotate_gif(&src, R90).unwrap();
+        let out = rotate_gif(&src, R90, None).unwrap();
         let mut opts = gif::DecodeOptions::new();
         opts.set_color_output(gif::ColorOutput::Indexed);
         let mut dec = opts.read_info(Cursor::new(&out)).unwrap();
@@ -1130,7 +1253,7 @@ mod tests {
         enc.set_icc_profile(b"fake icc".to_vec());
         enc.encode(sample().as_bytes(), 3, 2, image_webp::ColorType::Rgb8).unwrap();
 
-        let out = rotate_webp(&src, R90).unwrap();
+        let out = rotate_webp(&src, R90, None).unwrap();
         assert_rotated(&out, ImageFormat::WebP);
         let chunk = |kind: &[u8]| {
             let p = out.windows(4).position(|w| w == kind).unwrap();
@@ -1163,7 +1286,7 @@ mod tests {
     #[test]
     fn tiff_keeps_tags() {
         let src = tiff_sample();
-        let out = rotate_tiff(&src, R90).unwrap();
+        let out = rotate_tiff(&src, R90, None).unwrap();
         assert_rotated(&out, ImageFormat::Tiff);
         assert_eq!(read_exif(&out), (1, 300, 72, 2, 3));
         let e = tiff_endian(&out).unwrap();
@@ -1181,13 +1304,13 @@ mod tests {
         let n = e.u16(&src[ifd0..]) as usize;
         let next = ifd0 + 2 + n * 12;
         src[next..next + 4].copy_from_slice(&(ifd0 as u32).to_le_bytes());
-        assert!(rotate_tiff(&src, R90).is_err());
+        assert!(rotate_tiff(&src, R90, None).is_err());
     }
 
     #[test]
     fn bmp_rotates() {
         let src = encode(&sample(), ImageFormat::Bmp).unwrap();
-        assert_rotated(&rotate_bmp(&src, R90).unwrap(), ImageFormat::Bmp);
+        assert_rotated(&rotate_bmp(&src, R90, None).unwrap(), ImageFormat::Bmp);
     }
 
     #[test]
@@ -1199,11 +1322,11 @@ mod tests {
 
         let first = unique_path(&src, "rot90");
         assert_eq!(first, dir.join("a_rot90.png"));
-        save_transformed(&src, &first, R90).unwrap();
+        save_transformed(&src, &first, R90, None).unwrap();
         assert_eq!(unique_path(&src, "rot90"), dir.join("a_rot90_1.png"));
-        assert!(save_transformed(&src, &src, Transform { angle: 0, mirror: false }).is_err());
+        assert!(save_transformed(&src, &src, Transform { angle: 0, mirror: false }, None).is_err());
 
-        save_transformed(&src, &src, R90).unwrap();
+        save_transformed(&src, &src, R90, None).unwrap();
         assert_eq!(image::open(&src).unwrap().dimensions(), (2, 3));
         let leftovers = std::fs::read_dir(&dir).unwrap().filter(|e| {
             e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".rview-tmp")
@@ -1254,7 +1377,7 @@ mod tests {
                     continue;
                 }
                 let t = Transform { angle, mirror };
-                let out = rotate_gif(&src, t).unwrap();
+                let out = rotate_gif(&src, t, None).unwrap();
                 let got = image::load_from_memory_with_format(&out, ImageFormat::Gif).unwrap();
                 assert_eq!(got.to_rgba8(), rotate_image(&original, t).to_rgba8(), "{t:?}");
             }
@@ -1264,9 +1387,65 @@ mod tests {
     #[test]
     fn png_mirror_only() {
         let src = encode(&sample(), ImageFormat::Png).unwrap();
-        let out = rotate_png(&src, Transform { angle: 0, mirror: true }).unwrap();
+        let out = rotate_png(&src, Transform { angle: 0, mirror: true }, None).unwrap();
         let got = image::load_from_memory_with_format(&out, ImageFormat::Png).unwrap();
         assert_eq!(got.to_rgb8(), sample().fliph().to_rgb8());
+    }
+
+    /// サイズ変更は回転の前に元画像の向きで行い、EXIF の画素数も新しい大きさになる
+    #[test]
+    fn resize_then_rotate_updates_dimensions() {
+        let mut base = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut base, 95)
+            .encode_image(&sample())
+            .unwrap();
+        let mut src = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        let body = [b"Exif\0\0".as_slice(), &exif_blob()].concat();
+        src.extend(((body.len() + 2) as u16).to_be_bytes());
+        src.extend(body);
+        src.extend_from_slice(&base[2..]);
+
+        let out = rotate_jpeg(&src, R90, Some((6, 4))).unwrap();
+        let got = image::load_from_memory_with_format(&out, ImageFormat::Jpeg).unwrap();
+        assert_eq!(got.dimensions(), (4, 6));
+        let exif_len = be16(&out[4..]) as usize;
+        assert_eq!(read_exif(&out[12..4 + exif_len]), (1, 300, 72, 4, 6));
+
+        // 回転なしのサイズ変更だけでも保存できる
+        let png = encode(&sample(), ImageFormat::Png).unwrap();
+        let out = transform_bytes(&png, Transform { angle: 0, mirror: false }, Some((30, 20))).unwrap();
+        assert_eq!(image::load_from_memory(&out).unwrap().dimensions(), (30, 20));
+
+        let tiff = rotate_tiff(&tiff_sample(), Transform { angle: 0, mirror: false }, Some((300, 2))).unwrap();
+        assert_eq!(image::load_from_memory(&tiff).unwrap().dimensions(), (300, 2));
+        assert_eq!(read_exif(&tiff), (1, 72, 300, 300, 2));
+    }
+
+    /// GIF の拡大縮小は最近傍法で、部分フレームの位置も一緒に拡大縮小される
+    #[test]
+    fn gif_resize_scales_frames() {
+        let mut src = Vec::new();
+        {
+            let palette: Vec<u8> = (0..8u8).flat_map(|i| [i * 30, 255 - i * 30, i * 10]).collect();
+            let mut enc = gif::Encoder::new(&mut src, 4, 3, &palette).unwrap();
+            let mut f = gif::Frame::default();
+            f.left = 1;
+            f.top = 1;
+            f.width = 3;
+            f.height = 2;
+            f.buffer = vec![1, 2, 3, 4, 5, 6].into();
+            enc.write_frame(&f).unwrap();
+        }
+        let original = image::load_from_memory_with_format(&src, ImageFormat::Gif).unwrap();
+        let want = original.resize_exact(8, 6, FilterType::Nearest);
+        for mirror in [false, true] {
+            let t = Transform { angle: 90, mirror };
+            let out = rotate_gif(&src, t, Some((8, 6))).unwrap();
+            let got = image::load_from_memory_with_format(&out, ImageFormat::Gif).unwrap();
+            assert_eq!(got.to_rgba8(), rotate_image(&want, t).to_rgba8(), "{t:?}");
+        }
+        let out = rotate_gif(&src, Transform { angle: 0, mirror: false }, Some((2, 2))).unwrap();
+        assert_eq!(image::load_from_memory(&out).unwrap().dimensions(), (2, 2));
     }
 
     #[test]

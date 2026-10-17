@@ -4,6 +4,7 @@ use egui::{ColorImage, TextureHandle, TextureOptions}; // eguiから画像関連
 use std::path::{Path, PathBuf}; // ファイルパスを扱うための型
 use std::time::{Duration, Instant}; // 時間を扱うための型
 
+mod filter; // ファイル名・解像度による画像の絞り込み
 mod rotate_save; // 回転画像のメタデータ保持保存
 
 // ソート順を定義する列挙型
@@ -35,9 +36,13 @@ enum MenuAction {
     Rotate(f32),        // 指定した角度で画像を回転
     FlipHorizontal,     // 画像を左右反転
     FlipVertical,       // 画像を上下反転
+    ResizeImage,        // 画像サイズの変更ダイアログを開く
+    ToggleResizeWindow, // リサイズウインドウ（連続リサイズ用）の表示/非表示
+    ToggleFilterWindow, // フィルターウインドウの表示/非表示
     SaveOverwrite,      // 回転した画像を上書き保存
     SaveAsNew,          // 回転した画像を別名で新規保存
-    Reload,             // 現在の画像を再読み込み
+    Delete,             // 現在の画像をゴミ箱へ移動
+    Reload,            // 現在の画像を再読み込み
     ResizeWindow,       // 画像のサイズに合わせてウインドウをリサイズ
     Quit,               // アプリケーションを終了
 }
@@ -52,6 +57,9 @@ const SCROLL_THRESHOLD: f32 = 10.0;        // スクロール検出の閾値 (�
 // リセットしないと、閾値未満の微小スクロールが時間をまたいで累積し、
 // 意図しないタイミングで画像が切り替わる。
 const SCROLL_RESET_MS: u64 = 150;
+// フォルダ監視で最後の変更イベントからこの時間静かになったら一覧を取り直す (ミリ秒)。
+// コピー中のファイルは Create の後に Modify が大量に届くため、まとめて 1 回だけ処理する
+const FS_REFRESH_DEBOUNCE_MS: u64 = 300;
 const SUPPORTED_EXTENSIONS: &[&str] = &[  // サポートする画像ファイルの拡張子
     "jpeg", "jpg", "bmp", "gif", "tiff", "tif", "png", "webp",
 ];
@@ -66,6 +74,12 @@ const MAX_CONCURRENT_DECODES: usize = 3;
 // ファイルドラッグ開始とみなすポインタ移動量 (ポイント)。ドラッグ送出は Linux / macOS のみ
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const DRAG_START_THRESHOLD: f32 = 6.0;
+// 解像度フィルターの絞り込み結果を、解像度の取得中に反映し直す間隔 (ミリ秒)
+const FILTER_REAPPLY_MS: u64 = 200;
+// 解像度の取得結果をまとめて送る件数（1 件ごとに再描画を起こさないため）
+const DIMENSION_BATCH: usize = 64;
+// 画像サイズの変更ダイアログで指定できる幅・高さの上限 (ピクセル)。GIF の上限に合わせる
+const MAX_RESIZE_SIDE: u32 = 65535;
 
 // main関数: アプリケーションのエントリーポイント5
 fn main() -> eframe::Result<()> {
@@ -100,7 +114,17 @@ struct App {
     current_file: Option<PathBuf>,            // 現在表示している画像のファイルパス
     current_texture: Option<TextureHandle>,   // 現在表示している画像のテクスチャハンドル
     current_image_size: Option<(u32, u32)>,   // 現在の画像の元のサイズ (幅, 高さ)
-    images: Vec<PathBuf>,                     // ディレクトリ内の画像ファイル一覧
+    images: Vec<PathBuf>,                     // 表示対象の画像ファイル一覧（フィルター適用後）
+    all_images: Vec<PathBuf>,                 // ディレクトリ内の全画像ファイル（フィルター適用前）
+    filter_input: filter::FilterInput,        // フィルターウインドウの入力値（閉じても保持し、条件も有効のまま）
+    filter_window_open: bool,                 // フィルターウインドウを表示しているか
+    // 解像度フィルター用の画像の (幅, 高さ)。None は読めなかった画像。ヘッダだけ読むので軽い
+    dim_cache: std::collections::HashMap<PathBuf, Option<(u32, u32)>>,
+    dim_pending: std::collections::HashSet<PathBuf>, // 解像度を取得中の画像
+    dim_sender: std::sync::mpsc::Sender<Vec<(PathBuf, Option<(u32, u32)>)>>,
+    dim_receiver: std::sync::mpsc::Receiver<Vec<(PathBuf, Option<(u32, u32)>)>>,
+    dim_last_apply: Instant,                  // 解像度の取得中に最後に絞り込みを反映した時刻
+    dim_dirty: bool,                          // 取得した解像度をまだ絞り込みに反映していないか
     current_index: usize,                     // imagesベクタ内での現在の画像のインデックス
     is_sliding: bool,                         // スライドショーが有効かどうか
     slide_last: Instant,                      // 最後にスライドショーで画像を変更した時刻
@@ -111,6 +135,17 @@ struct App {
     // 回転・反転の状態は保存後も次の画像へ引き継ぐが、保存した画像自体は既に変換済みなので、
     // 表示中はこの分を差し引いて二重に回転しないようにする
     applied_transform: Option<(PathBuf, rotate_save::Transform)>,
+    // 保存時に適用する画像サイズと、その対象ファイル。サイズは回転・反転前の元画像の向きでの (幅, 高さ)。
+    // 画像ごとに大きさが違うので、回転・反転と違って他の画像には引き継がない
+    pending_resize: Option<(PathBuf, (u32, u32))>,
+    resize_dialog: Option<ResizeDialog>,      // 画像サイズの変更ダイアログ（表示中のみ Some）
+    resize_window: ResizeWindow,              // リサイズウインドウ（閉じても入力値は保持する）
+    save_job: Option<SaveJob>,                // バックグラウンドで実行中の「リサイズして別名保存」
+    save_queue: std::collections::VecDeque<SaveRequest>, // 実行待ちの「リサイズして別名保存」（受け付け順に 1 件ずつ実行）
+    switch_to_saved: Option<SavedSwitch>,     // 保存完了後、読み込みを待って表示を切り替える先
+    // 自分で書き込んだファイルと、そのときの更新日時。フォルダ監視の変更通知のうち、
+    // 内容が書き込んだときのままのものはキャッシュを捨てない（切り替え直後に「読み込み中」が挟まるのを防ぐ）
+    self_written: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     key_overlay_text: String,                 // オーバーレイ表示するテキスト
     key_overlay_hide_at: Option<Instant>,     // オーバーレイを非表示にする時刻
     last_scroll_shift: Option<Instant>,        // スクロールデバウンス用タイムスタンプ
@@ -133,6 +168,87 @@ struct App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     file_drag_triggered: bool,    // 現在のドラッグジェスチャで既に DnD を起動したか
     sort_order: SortOrder,        // 画像リストのソート順
+    // フォルダ監視。表示中のディレクトリへのファイル追加・削除・変更を検知して一覧を更新する
+    watcher: Option<notify::RecommendedWatcher>,  // 監視中のウォッチャー（drop で監視停止）
+    watched_dir: Option<PathBuf>,                 // 監視中のディレクトリ
+    fs_event_sender: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+    fs_event_receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    fs_changed_paths: std::collections::HashSet<PathBuf>, // デバウンス中に溜めた変更パス
+    fs_last_event: Option<Instant>,               // 最後に変更イベントを受けた時刻（未処理がなければ None）
+}
+
+/// 画像サイズの変更ダイアログの状態。幅・高さは画面に表示している向き（回転・反転後）で扱う
+struct ResizeDialog {
+    path: PathBuf,           // 対象の画像
+    original: (u32, u32),    // 元の大きさ（表示の向き）
+    swaps_xy: bool,          // 表示の向きが元画像と縦横入れ替わっているか
+    width: u32,
+    height: u32,
+    keep_aspect: bool,       // アスペクト比を固定するか
+}
+
+impl ResizeDialog {
+    // 幅に合わせて、元のアスペクト比になるよう高さを決める
+    fn fit_height(&mut self) {
+        let (ow, oh) = self.original;
+        let h = (self.width as f64 * oh as f64 / ow as f64).round() as u32;
+        self.height = h.clamp(1, MAX_RESIZE_SIDE);
+    }
+
+    // 高さに合わせて、元のアスペクト比になるよう幅を決める
+    fn fit_width(&mut self) {
+        let (ow, oh) = self.original;
+        let w = (self.height as f64 * ow as f64 / oh as f64).round() as u32;
+        self.width = w.clamp(1, MAX_RESIZE_SIDE);
+    }
+}
+
+/// 右上に表示するリサイズウインドウの状態。表示する画像を変えても入力値は保持し、
+/// 何枚でも続けて「リサイズして別名保存」できるようにする。
+/// 幅・高さは画面に表示している向き（回転・反転後）で扱う
+#[derive(Default)]
+struct ResizeWindow {
+    open: bool,
+    initialized: bool,  // 入力欄を一度でも画像のサイズで初期化したか
+    width: u32,
+    height: u32,
+    keep_aspect: bool,  // オンなら各画像の縦横比を保ったまま 幅 x 高さ の枠に収める
+}
+
+impl ResizeWindow {
+    /// 表示の向きで (vw, vh) の画像を保存するときの大きさ
+    fn target_size(&self, (vw, vh): (u32, u32)) -> (u32, u32) {
+        if !self.keep_aspect {
+            return (self.width, self.height);
+        }
+        let s = (self.width as f64 / vw as f64).min(self.height as f64 / vh as f64);
+        let fit = |v: u32| ((v as f64 * s).round() as u32).clamp(1, MAX_RESIZE_SIDE);
+        (fit(vw), fit(vh))
+    }
+}
+
+/// 「リサイズして別名保存」の 1 件分。内容（サイズ・回転・反転・保存先）は受け付けた時点で決める
+struct SaveRequest {
+    src: PathBuf,
+    dst: PathBuf,
+    transform: rotate_save::Transform, // ファイルに施す変換
+    resize: Option<(u32, u32)>,        // 元画像の向きでの (幅, 高さ)
+    applied: rotate_save::Transform,   // 保存したファイルに焼き込んだ表示上の回転・反転
+}
+
+/// バックグラウンドで実行中の「リサイズして別名保存」。
+/// 保存中は元の画像を表示したままにし、完了してから表示を切り替える
+struct SaveJob {
+    request: SaveRequest,
+    receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+}
+
+/// 保存したファイルへの表示の切り替え待ち。保存したファイルのデコードが終わってから切り替えて、
+/// 切り替えの間に「読み込み中」が挟まらないようにする
+struct SavedSwitch {
+    src: PathBuf, // この画像を表示したままのときだけ切り替える
+    dst: PathBuf,
+    applied: rotate_save::Transform,
 }
 
 /// バックグラウンドスレッドから返るデコード結果。
@@ -152,12 +268,23 @@ impl App {
     // 新しいAppインスタンスを作成する
     fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let (fs_tx, fs_rx) = std::sync::mpsc::channel();
+        let (dim_tx, dim_rx) = std::sync::mpsc::channel();
         Self {
             current_dir: PathBuf::from("./"), // 実行ディレクトリを初期値に
             current_file: None,
             current_texture: None,
             current_image_size: None,
             images: Vec::new(),
+            all_images: Vec::new(),
+            filter_input: filter::FilterInput::default(),
+            filter_window_open: false,
+            dim_cache: std::collections::HashMap::new(),
+            dim_pending: std::collections::HashSet::new(),
+            dim_sender: dim_tx,
+            dim_receiver: dim_rx,
+            dim_last_apply: Instant::now(),
+            dim_dirty: false,
             current_index: 0,
             is_sliding: false,
             slide_last: Instant::now(),
@@ -165,6 +292,13 @@ impl App {
             flip_h: false,
             flip_v: false,
             applied_transform: None,
+            pending_resize: None,
+            resize_dialog: None,
+            resize_window: ResizeWindow::default(),
+            save_job: None,
+            save_queue: std::collections::VecDeque::new(),
+            switch_to_saved: None,
+            self_written: std::collections::HashMap::new(),
             key_overlay_text: String::new(),
             key_overlay_hide_at: None,
             last_scroll_shift: None,
@@ -187,32 +321,204 @@ impl App {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             file_drag_triggered: false,
             sort_order: SortOrder::Natural,
+            watcher: None,
+            watched_dir: None,
+            fs_event_sender: fs_tx,
+            fs_event_receiver: fs_rx,
+            fs_changed_paths: std::collections::HashSet::new(),
+            fs_last_event: None,
         }
     }
 
     // 指定されたディレクトリ内の画像ファイルをリストアップする
+    // 一覧は all_images に入れ、フィルターに合うものだけを images にする（並べ替えは呼び出し側）
     fn list_up_images(&mut self, dir: &Path) {
         self.images.clear(); // 既存のリストをクリア
+        self.all_images.clear();
         let Ok(entries) = std::fs::read_dir(dir) else {
             // ディレクトリが読めなければ何もしない
             return;
         };
         // ディレクトリエントリをフィルタリングして画像ファイルのみを収集
-        self.images = entries
+        self.all_images = entries
             .filter_map(|e| e.ok()) // ResultをOptionに変換し、エラーを除外
             .map(|e| e.path())       // DirEntryをPathBufに変換
-            .filter(|p| {
-                // ファイルであり、かつサポートされている拡張子を持つかチェック
-                p.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| {
-                            let lower = e.to_ascii_lowercase(); // 拡張子を小文字に
-                            SUPPORTED_EXTENSIONS.contains(&lower.as_str()) // サポートリストに含まれるか
-                        })
-                        .unwrap_or(false) // 拡張子がない場合はfalse
-            })
+            .filter(|p| p.is_file() && has_supported_extension(p)) // ファイルであり、かつサポートされている拡張子を持つか
             .collect(); // フィルタリングされたパスをVecに収集
+        self.images = self.filtered_images();
+    }
+
+    // 現在の条件（読めない入力欄は無視）
+    fn current_filter(&self) -> filter::Filter {
+        self.filter_input.parse().unwrap_or_default()
+    }
+
+    // all_images のうちフィルターに合うもの。解像度が未取得の画像は、解像度の条件があれば含めない
+    fn filtered_images(&self) -> Vec<PathBuf> {
+        let f = self.current_filter();
+        if !f.is_active() {
+            return self.all_images.clone();
+        }
+        self.all_images
+            .iter()
+            .filter(|p| f.matches_name(p))
+            .filter(|p| !f.needs_dimensions() || f.matches_dimensions(self.dim_cache.get(*p).copied().flatten()))
+            .cloned()
+            .collect()
+    }
+
+    // フィルターの条件や解像度の取得結果が変わったので、表示対象を絞り込み直す。
+    // 表示中の画像が残っていればそのまま、外れたら絞り込み結果の先頭を表示する
+    fn apply_filter(&mut self, ctx: &egui::Context) {
+        self.dim_dirty = false;
+        self.dim_last_apply = Instant::now();
+        let filtered = self.filtered_images();
+        let old = std::mem::replace(&mut self.images, filtered);
+        self.apply_sort();
+        if self.images == old {
+            return; // 表示対象が変わらなければ何もしない
+        }
+        if self.images.is_empty() {
+            self.slide_show(false);
+            self.current_texture = None;
+            self.current_file = None;
+            self.current_image_size = None;
+            self.current_index = 0;
+            return;
+        }
+        match self.current_file.clone() {
+            Some(cur) if self.images.contains(&cur) => self.set_current_index_by_path(&cur),
+            _ => self.current_index = 0,
+        }
+        self.load_current_image(ctx);
+    }
+
+    // 解像度の条件があれば、まだ解像度を知らない画像をバックグラウンドで調べる。
+    // 取得結果を受け取り、一定間隔で絞り込みに反映する
+    fn poll_dimensions(&mut self, ctx: &egui::Context) {
+        while let Ok(batch) = self.dim_receiver.try_recv() {
+            for (path, dims) in batch {
+                self.dim_pending.remove(&path);
+                self.dim_cache.insert(path, dims);
+            }
+            self.dim_dirty = true;
+        }
+        let needs = self.current_filter().needs_dimensions();
+        if needs {
+            let missing: Vec<PathBuf> = self
+                .all_images
+                .iter()
+                .filter(|p| !self.dim_cache.contains_key(*p) && !self.dim_pending.contains(*p))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                self.dim_pending.extend(missing.iter().cloned());
+                let tx = self.dim_sender.clone();
+                let ctx_clone = ctx.clone();
+                std::thread::spawn(move || {
+                    for chunk in missing.chunks(DIMENSION_BATCH) {
+                        let batch = chunk.iter().map(|p| (p.clone(), image::image_dimensions(p).ok())).collect();
+                        if tx.send(batch).is_err() {
+                            return;
+                        }
+                        ctx_clone.request_repaint();
+                    }
+                });
+            }
+        }
+        if !self.dim_dirty {
+            return;
+        }
+        if !needs {
+            self.dim_dirty = false;
+            return;
+        }
+        // 取得中は間隔を空けて反映し、取得し終えたらすぐ反映する
+        let due = self.dim_last_apply + Duration::from_millis(FILTER_REAPPLY_MS);
+        let now = Instant::now();
+        if self.dim_pending.is_empty() || now >= due {
+            self.apply_filter(ctx);
+        } else {
+            ctx.request_repaint_after(due - now);
+        }
+    }
+
+    // フィルターウインドウ（左上）を描画する。入力が変わるたびにすぐ絞り込む
+    fn show_filter_window(&mut self, ctx: &egui::Context) {
+        if !self.filter_window_open {
+            return;
+        }
+        let before = self.current_filter();
+        let invalid = self.filter_input.parse().err().unwrap_or_default();
+        let (matched, total, scanning) = (self.images.len(), self.all_images.len(), self.dim_pending.len());
+        let needs_dims = before.needs_dimensions();
+        let mut close = false;
+        let input = &mut self.filter_input;
+        egui::Window::new("フィルター")
+            .id(egui::Id::new("filter_window"))
+            // ドラッグで移動できるよう固定（anchor）はせず、初期位置だけ左上に置く。
+            // 高さはリサイズウインドウ（右上）と揃える
+            .pivot(egui::Align2::LEFT_TOP)
+            .default_pos(ctx.screen_rect().left_top() + egui::vec2(10.0, 10.0))
+            .movable(true)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let num_field = |ui: &mut egui::Ui, text: &mut String| {
+                    ui.add(egui::TextEdit::singleline(text).desired_width(60.0).hint_text("制限なし"));
+                };
+                egui::Grid::new("filter_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("ファイル名：");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut input.name)
+                            .desired_width(180.0)
+                            .hint_text("例: cat  *.png"),
+                    )
+                    .on_hover_text("部分一致（大文字小文字は区別しない）。空白で区切ると AND、* と ? はワイルドカード");
+                    ui.end_row();
+                    ui.label("幅：");
+                    ui.horizontal(|ui| {
+                        num_field(ui, &mut input.min_w);
+                        ui.label("〜");
+                        num_field(ui, &mut input.max_w);
+                        ui.label("px");
+                    });
+                    ui.end_row();
+                    ui.label("高さ：");
+                    ui.horizontal(|ui| {
+                        num_field(ui, &mut input.min_h);
+                        ui.label("〜");
+                        num_field(ui, &mut input.max_h);
+                        ui.label("px");
+                    });
+                    ui.end_row();
+                });
+                if !invalid.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("数値を入力してください: {}", invalid.join("、")));
+                }
+                let mut status = format!("一致: {matched} / {total} 件");
+                if needs_dims && scanning > 0 {
+                    status.push_str(&format!("（解像度を取得中… 残り {scanning} 件）"));
+                }
+                ui.label(status);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("クリア").clicked() {
+                        input.clear();
+                    }
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            // 閉じても条件は有効のまま（解除はクリアで行う）
+            self.filter_window_open = false;
+        }
+        if self.current_filter() != before {
+            self.apply_filter(ctx);
+        }
     }
 
     // 画像リストを自然順ソートする
@@ -259,7 +565,14 @@ impl App {
         self.texture_cache.clear();
         self.cache_generation = self.cache_generation.wrapping_add(1);
 
+        // 別のフォルダを開いたら、前のフォルダの解像度は不要なので捨てる
+        if self.current_dir != dir {
+            self.dim_cache.clear();
+        }
         self.list_up_images(dir); // 画像をリストアップ
+        // 画像がまだないフォルダでも、後から追加された画像を表示できるよう監視は始めておく
+        self.current_dir = dir.to_path_buf();
+        self.watch_dir(dir, ctx);
         if self.images.is_empty() {
             // 画像がなければテクスチャなどをクリアして終了
             self.current_texture = None;
@@ -273,8 +586,113 @@ impl App {
             Some(f) => self.set_current_index_by_path(f),
             None => self.current_index = 0,
         }
-        self.current_dir = dir.to_path_buf(); // 現在のディレクトリを更新
         self.load_current_image(ctx); // 現在のインデックスの画像を読み込む
+    }
+
+    // 指定ディレクトリの監視を始める（非再帰）。既に同じディレクトリを監視中なら何もしない。
+    // 監視できない場所（一部のネットワークドライブなど）では失敗するが、その場合は F5 で手動更新する
+    fn watch_dir(&mut self, dir: &Path, ctx: &egui::Context) {
+        if self.watched_dir.as_deref() == Some(dir) && self.watcher.is_some() {
+            return;
+        }
+        // 古いウォッチャーを先に drop して前のディレクトリの監視を止める
+        self.watcher = None;
+        self.watched_dir = None;
+        // 前のディレクトリの未処理イベントは無意味なので捨てる
+        self.fs_changed_paths.clear();
+        self.fs_last_event = None;
+        while self.fs_event_receiver.try_recv().is_ok() {}
+
+        use notify::Watcher;
+        let tx = self.fs_event_sender.clone();
+        let ctx_clone = ctx.clone();
+        let result = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+            // egui は入力がないと update() を呼ばないので、イベントのたびに起こす
+            ctx_clone.request_repaint();
+        })
+        .and_then(|mut w| w.watch(dir, notify::RecursiveMode::NonRecursive).map(|()| w));
+        match result {
+            Ok(w) => {
+                self.watcher = Some(w);
+                self.watched_dir = Some(dir.to_path_buf());
+            }
+            Err(e) => eprintln!("フォルダを監視できません: {}: {e}", dir.display()),
+        }
+    }
+
+    // フォルダ監視のイベントを取り込み、変化が落ち着いたら一覧を取り直す
+    fn poll_fs_events(&mut self, ctx: &egui::Context) {
+        while let Ok(res) = self.fs_event_receiver.try_recv() {
+            let Ok(event) = res else { continue };
+            // ファイルを開いた・閉じただけのアクセスイベントは無視する。
+            // 拾うと自分のデコードで発生したイベントで再読み込みが無限に繰り返される
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                continue;
+            }
+            let mut relevant = false;
+            for path in event.paths {
+                if has_supported_extension(&path) {
+                    self.fs_changed_paths.insert(path);
+                    relevant = true;
+                }
+            }
+            if relevant {
+                self.fs_last_event = Some(Instant::now());
+            }
+        }
+
+        let Some(last) = self.fs_last_event else { return };
+        let quiet_at = last + Duration::from_millis(FS_REFRESH_DEBOUNCE_MS);
+        let now = Instant::now();
+        if now < quiet_at {
+            // 以降イベントが来なくても処理されるよう、静かになる時刻に再描画を予約する
+            ctx.request_repaint_after(quiet_at - now);
+            return;
+        }
+        self.fs_last_event = None;
+        let mut changed = std::mem::take(&mut self.fs_changed_paths);
+        changed.retain(|p| {
+            let Some(written) = self.self_written.remove(p) else { return true };
+            let mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            mtime != Some(written) // 書き込んだ後に他から変更されていれば捨てる
+        });
+        self.refresh_image_list(&changed, ctx);
+    }
+
+    // 表示中の画像を保ったまま一覧を取り直す。
+    // init_images と違ってキャッシュ全体は捨てないので、変化のない画像は読み直さない
+    fn refresh_image_list(&mut self, changed: &std::collections::HashSet<PathBuf>, ctx: &egui::Context) {
+        // 内容が変わった（上書き・コピー途中だった）画像のキャッシュは古いので捨てる。
+        // 読み込み中のものがあれば世代を進めて、古い内容のデコード結果を受信時に破棄させる
+        if changed.iter().any(|p| self.loading_images.contains(p)) {
+            self.cache_generation = self.cache_generation.wrapping_add(1);
+        }
+        for p in changed {
+            self.texture_cache.remove(p);
+            self.dim_cache.remove(p); // 内容が変わったので解像度も取り直す
+        }
+
+        let dir = self.current_dir.clone();
+        let old_index = self.current_index;
+        self.list_up_images(&dir);
+        self.apply_sort();
+
+        if self.images.is_empty() {
+            self.slide_show(false);
+            self.current_texture = None;
+            self.current_file = None;
+            self.current_image_size = None;
+            self.current_index = 0;
+            return;
+        }
+        match self.current_file.clone() {
+            // 表示中の画像が残っていれば、その画像の新しい位置へ
+            Some(cur) if self.images.contains(&cur) => self.set_current_index_by_path(&cur),
+            // 消えていれば同じ位置の画像（末尾を超えるなら最後の画像）を表示する
+            _ => self.current_index = old_index.min(self.images.len() - 1),
+        }
+        self.load_current_image(ctx);
     }
 
     // 起動時のコマンドライン引数を処理する
@@ -424,34 +842,39 @@ impl App {
                 continue;
             }
             budget -= 1;
-            self.loading_images.insert(path.clone());
-            let tx = self.texture_sender.clone();
-            let ctx_clone = ctx.clone();
-            let generation = self.cache_generation;
-
-            std::thread::spawn(move || {
-                // 壊れた画像で image クレートが panic すると結果が送られず、
-                // loading_images にパスが残り続けて永久に「読み込み中」になるため捕捉する
-                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    image::open(&path).map(|img| {
-                        let (w, h) = (img.width(), img.height());
-                        let rgba = img.to_rgba8();
-                        let color_image = ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            rgba.as_raw(),
-                        );
-                        (color_image, (w, h))
-                    })
-                }));
-                let result = match decoded {
-                    Ok(Ok(image)) => Ok(image),
-                    Ok(Err(e)) => Err(format!("{e}")),
-                    Err(_) => Err("デコードに失敗しました".to_string()),
-                };
-                let _ = tx.send(DecodedImage { path, generation, result });
-                ctx_clone.request_repaint();
-            });
+            self.spawn_decode(path, ctx);
         }
+    }
+
+    // `path` のデコードをバックグラウンドスレッドで始める。結果は texture_receiver に届く
+    fn spawn_decode(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.loading_images.insert(path.clone());
+        let tx = self.texture_sender.clone();
+        let ctx_clone = ctx.clone();
+        let generation = self.cache_generation;
+
+        std::thread::spawn(move || {
+            // 壊れた画像で image クレートが panic すると結果が送られず、
+            // loading_images にパスが残り続けて永久に「読み込み中」になるため捕捉する
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                image::open(&path).map(|img| {
+                    let (w, h) = (img.width(), img.height());
+                    let rgba = img.to_rgba8();
+                    let color_image = ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_raw(),
+                    );
+                    (color_image, (w, h))
+                })
+            }));
+            let result = match decoded {
+                Ok(Ok(image)) => Ok(image),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => Err("デコードに失敗しました".to_string()),
+            };
+            let _ = tx.send(DecodedImage { path, generation, result });
+            ctx_clone.request_repaint();
+        });
     }
 
     // スライドショーの開始/停止を設定する
@@ -497,9 +920,17 @@ impl App {
         }
     }
 
-    // 回転・反転の状態を (左上に表示するラベル, 新規保存のファイル名に付ける文字列) の列で返す。
-    // 何もしていなければ空
-    fn transform_labels(&self) -> Vec<(String, String)> {
+    // 表示中の画像に保存時に適用するサイズ（元画像の向きでの (幅, 高さ)）
+    fn current_resize(&self) -> Option<(u32, u32)> {
+        match (&self.pending_resize, &self.current_file) {
+            (Some((p, size)), Some(cur)) if p == cur => Some(*size),
+            _ => None,
+        }
+    }
+
+    // 回転・反転と、サイズ変更 `resize`（元画像の向きでの (幅, 高さ)）の状態を
+    // (左上に表示するラベル, 新規保存のファイル名に付ける文字列) の列で返す。何もしていなければ空
+    fn transform_labels(&self, resize: Option<(u32, u32)>) -> Vec<(String, String)> {
         let r = (self.rotation_angle as i32).rem_euclid(360);
         let mut labels = Vec::new();
         if r != 0 {
@@ -511,18 +942,39 @@ impl App {
         if self.flip_v {
             labels.push(("上下反転".to_string(), "flipv".to_string()));
         }
+        if let Some((w, h)) = resize {
+            // 保存後の向きで表示する
+            let (w, h) = if self.effective_transform().swaps_xy() { (h, w) } else { (w, h) };
+            labels.push((format!("サイズ: {w}x{h}"), format!("{w}x{h}")));
+        }
         labels
     }
 
-    // 回転・反転した画像をメタデータを保ったまま保存する。
+    // 回転・反転・サイズ変更した画像をメタデータを保ったまま保存する。
     // overwrite が true なら上書き、false なら `元名_rot90.ext` のような別名で新規保存する
     fn save_rotated_image(&mut self, overwrite: bool, ctx: &egui::Context) {
+        let resize = self.current_resize();
+        self.save_edited_image(overwrite, resize, ctx);
+    }
+
+    // 新規保存の保存先。例: 元名_rot90_fliph_800x600.png
+    // 実行中・実行待ちの保存先とも重ならない名前にする（同じ画像を続けて保存しても上書きし合わないように）
+    fn new_save_path(&self, path: &Path, resize: Option<(u32, u32)>) -> PathBuf {
+        let parts: Vec<String> = self.transform_labels(resize).into_iter().map(|(_, s)| s).collect();
+        let reserved = |p: &Path| {
+            self.save_job.iter().map(|j| &j.request).chain(&self.save_queue).any(|r| r.dst == p)
+        };
+        rotate_save::unique_path_excluding(path, &parts.join("_"), reserved)
+    }
+
+    // 回転・反転と、サイズ変更 `resize`（元画像の向きでの (幅, 高さ)）を施して保存する
+    fn save_edited_image(&mut self, overwrite: bool, resize: Option<(u32, u32)>, ctx: &egui::Context) {
         let Some(path) = self.current_file.clone() else {
             return;
         };
-        // 回転も反転もしていないなら書き込まない（再エンコードで画質を落とすだけなので）
+        // 回転も反転もサイズ変更もしていないなら書き込まない（再エンコードで画質を落とすだけなので）
         let transform = self.effective_transform();
-        if transform.is_identity() {
+        if transform.is_identity() && resize.is_none() {
             self.show_key(if self.showing_applied() { "Save: 保存済みです" } else { "Save: 回転・反転していません" });
             return;
         }
@@ -533,15 +985,15 @@ impl App {
         let dst = if overwrite {
             path.clone()
         } else {
-            // 例: 元名_rot90_fliph.png
-            let parts: Vec<String> = self.transform_labels().into_iter().map(|(_, s)| s).collect();
-            rotate_save::unique_path(&path, &parts.join("_"))
+            self.new_save_path(&path, resize)
         };
-        match rotate_save::save_transformed(&path, &dst, transform) {
+        match rotate_save::save_transformed(&path, &dst, transform, resize) {
             Ok(()) if overwrite => {
                 // 回転・反転の状態はリセットせず次の画像へ引き継ぐ。
                 // この画像はもう変換済みなので、表示中は焼き込んだ分を差し引く
                 self.applied_transform = Some((path.clone(), self.view_transform()));
+                // サイズ変更もファイルに焼き込んだので解除する
+                self.pending_resize = None;
                 // ファイルの中身が変わったので、キャッシュ済みテクスチャを捨てて
                 // 読み直す。これをしないと回転前の画像が表示されたままになる。
                 // 世代も進めて、保存前に走っていたデコード結果が後から
@@ -565,6 +1017,42 @@ impl App {
         if was_sliding {
             self.slide_show(true); // スライドショーを再開
         }
+    }
+
+    // 現在の画像をゴミ箱へ移動し、一覧から外して同じ位置の画像（末尾なら直前の画像）を表示する。
+    // 完全削除ではなくゴミ箱なので、誤操作しても復元できる。
+    // フォルダ監視でも同じ更新が後から届くが、すぐに次の画像を出すためここで一覧を直接更新する
+    fn delete_current_image(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.current_file.clone() else {
+            return;
+        };
+        if let Err(e) = trash::delete(&path) {
+            self.show_key(&format!("削除エラー: {e}"));
+            return;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+
+        self.images.retain(|p| *p != path);
+        self.all_images.retain(|p| *p != path);
+        self.texture_cache.remove(&path);
+        if self.pending_resize.as_ref().is_some_and(|(p, _)| *p == path) {
+            self.pending_resize = None;
+        }
+        if self.applied_transform.as_ref().is_some_and(|(p, _)| *p == path) {
+            self.applied_transform = None;
+        }
+        if self.images.is_empty() {
+            self.slide_show(false);
+            self.current_texture = None;
+            self.current_file = None;
+            self.current_image_size = None;
+            self.current_index = 0;
+        } else {
+            // 削除した画像の位置に後続の画像が詰まるので、インデックスはそのまま（末尾なら一つ前へ）
+            self.current_index = self.current_index.min(self.images.len() - 1);
+            self.load_current_image(ctx);
+        }
+        self.show_key(&format!("ゴミ箱へ移動: {name}"));
     }
 
     // 短いメッセージを画面右下にオーバーレイ表示する
@@ -622,10 +1110,16 @@ impl App {
         } else {
             String::new()
         };
+        // フィルターの状態（絞り込み前の総数も添える）
+        let filter_str = if self.current_filter().is_active() {
+            format!(" [-Filter: {}]", self.all_images.len())
+        } else {
+            String::new()
+        };
         // これらを結合してタイトルを生成
         format!(
-            "{}[{}]{} {}{}{}",
-            filename, dirname, size_str, index_str, slide_str, rot_str
+            "{}[{}]{} {}{}{}{}",
+            filename, dirname, size_str, index_str, filter_str, slide_str, rot_str
         )
     }
 
@@ -731,11 +1225,24 @@ impl App {
                 self.flip_v = !self.flip_v;
                 self.show_key("上下反転");
             }
+            MenuAction::ResizeImage => {
+                self.open_resize_dialog();
+            }
+            MenuAction::ToggleFilterWindow => {
+                self.filter_window_open = !self.filter_window_open;
+            }
+            MenuAction::ToggleResizeWindow => {
+                // 入力欄の初期化は show_resize_window で行う
+                self.resize_window.open = !self.resize_window.open;
+            }
             MenuAction::SaveOverwrite => {
                 self.save_rotated_image(true, ctx);
             }
             MenuAction::SaveAsNew => {
                 self.save_rotated_image(false, ctx);
+            }
+            MenuAction::Delete => {
+                self.delete_current_image(ctx);
             }
             MenuAction::Reload => {
                 // 何も開いていない状態では current_dir が初期値 "./"（プロセスの
@@ -774,8 +1281,340 @@ impl App {
         }
     }
 
+    // 表示中の画像の、画面に表示している向き（回転・反転後）での大きさ
+    fn current_view_size(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.current_image_size.filter(|&(w, h)| w > 0 && h > 0)?;
+        Some(if self.effective_transform().swaps_xy() { (h, w) } else { (w, h) })
+    }
+
+    // リサイズウインドウ（右上）を描画し、ボタン操作を処理する
+    fn show_resize_window(&mut self, ctx: &egui::Context) {
+        if !self.resize_window.open {
+            return;
+        }
+        let view_size = self.current_view_size();
+        // 初めて開いたときは、表示中の画像のサイズを入力欄の初期値にする
+        // （画像の読み込み前に開いた場合は、読み込み後に初期化する）
+        if !self.resize_window.initialized {
+            if let Some(size) = view_size {
+                (self.resize_window.width, self.resize_window.height) = size;
+                self.resize_window.keep_aspect = true;
+                self.resize_window.initialized = true;
+            }
+        }
+
+        let mut save = false;
+        let mut close = false;
+        let rw = &mut self.resize_window;
+        egui::Window::new("リサイズウインドウ")
+            .id(egui::Id::new("resize_window"))
+            // ドラッグで移動できるよう固定（anchor）はせず、初期位置だけ右上に置く
+            .pivot(egui::Align2::RIGHT_TOP)
+            .default_pos(ctx.screen_rect().right_top() + egui::vec2(-10.0, 10.0))
+            .movable(true)
+            .title_bar(false) // タイトルバーは出さず、入力欄だけのコンパクトな表示にする
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(match view_size {
+                    Some((w, h)) => format!("表示中の画像: {w} x {h}"),
+                    None => "表示中の画像: なし".to_string(),
+                });
+                ui.add_space(4.0);
+                egui::Grid::new("resize_window_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("幅：");
+                    let width_changed = ui
+                        .add(egui::DragValue::new(&mut rw.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
+                        .changed();
+                    ui.end_row();
+                    ui.label("高さ：");
+                    let height_changed = ui
+                        .add(egui::DragValue::new(&mut rw.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
+                        .changed();
+                    ui.end_row();
+                    // 固定中は、表示中の画像の縦横比でもう一方を合わせる
+                    if let (true, Some((vw, vh))) = (rw.keep_aspect, view_size) {
+                        let scaled = |v: u32, num: u32, den: u32| {
+                            ((v as f64 * num as f64 / den as f64).round() as u32).clamp(1, MAX_RESIZE_SIDE)
+                        };
+                        if width_changed {
+                            rw.height = scaled(rw.width, vh, vw);
+                        } else if height_changed {
+                            rw.width = scaled(rw.height, vw, vh);
+                        }
+                    }
+                });
+                ui.checkbox(&mut rw.keep_aspect, "アスペクト比を固定")
+                    .on_hover_text("オンにすると、各画像の縦横比を保ったまま 幅 x 高さ に収まる大きさで保存します");
+                if rw.keep_aspect {
+                    if let Some(size) = view_size {
+                        let (w, h) = rw.target_size(size);
+                        ui.weak(format!("保存サイズ: {w} x {h}"));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(view_size.is_some(), egui::Button::new("リサイズして別名保存"))
+                        .on_hover_text("Ctrl+S")
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.resize_window.open = false;
+        }
+        if save {
+            self.save_resized_as_new(ctx);
+        }
+    }
+
+    // リサイズウインドウの入力値で、表示中の画像を（回転・反転も施して）別名保存する
+    fn save_resized_as_new(&mut self, ctx: &egui::Context) {
+        let (Some(view), Some(raw)) = (self.current_view_size(), self.current_image_size) else {
+            return;
+        };
+        let (w, h) = self.resize_window.target_size(view);
+        let size = if self.effective_transform().swaps_xy() { (h, w) } else { (w, h) };
+        // 元と同じ大きさなら拡大縮小はしない（回転・反転だけなら保存する）
+        let resize = (size != raw).then_some(size);
+        if resize.is_none() && self.effective_transform().is_identity() {
+            self.show_key("Save: 元と同じサイズです");
+            return;
+        }
+        let Some(src) = self.current_file.clone() else {
+            return;
+        };
+        // 保存中でも受け付けて順番待ちにする。保存はバックグラウンドで行い、その間は元の画像を表示し続ける
+        let dst = self.new_save_path(&src, resize);
+        self.save_queue.push_back(SaveRequest {
+            src,
+            dst,
+            transform: self.effective_transform(),
+            resize,
+            applied: self.view_transform(),
+        });
+        self.start_next_save(ctx);
+        self.show_saving_status();
+    }
+
+    // 実行中の保存がなければ、順番待ちの先頭をバックグラウンドで保存し始める
+    fn start_next_save(&mut self, ctx: &egui::Context) {
+        if self.save_job.is_some() {
+            return;
+        }
+        let Some(request) = self.save_queue.pop_front() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (src, dst, transform, resize) = (request.src.clone(), request.dst.clone(), request.transform, request.resize);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| rotate_save::save_transformed(&src, &dst, transform, resize))
+                .unwrap_or_else(|_| Err("保存に失敗しました".to_string()));
+            let _ = tx.send(result);
+            ctx_clone.request_repaint();
+        });
+        self.save_job = Some(SaveJob { request, receiver: rx });
+    }
+
+    // 保存中の件数をオーバーレイに出す
+    fn show_saving_status(&mut self) {
+        let count = self.save_job.iter().count() + self.save_queue.len();
+        if count > 1 {
+            self.show_key(&format!("保存中... (残り {count} 件)"));
+        } else if count == 1 {
+            self.show_key("保存中...");
+        }
+    }
+
+    // 「リサイズして別名保存」の完了を確認する。完了したら一覧に加え、
+    // 保存したファイルを読み込んでから表示を切り替える（切り替えは decode 結果の受信時）
+    fn poll_save_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.save_job else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // 保存が長引いてもオーバーレイが消えないようにする
+                if self.key_overlay_hide_at.is_some_and(|t| t <= Instant::now()) || self.key_overlay_text.is_empty() {
+                    self.show_saving_status();
+                }
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("保存に失敗しました".to_string()),
+        };
+        let job = self.save_job.take().unwrap().request;
+        // 次の保存を始めてから、終わった分の後処理をする
+        self.start_next_save(ctx);
+        self.finish_save(job, result, ctx);
+    }
+
+    // 保存が 1 件終わったときの後処理。一覧に加え、表示中の画像の保存なら表示を切り替える
+    fn finish_save(&mut self, job: SaveRequest, result: Result<(), String>, ctx: &egui::Context) {
+        if let Err(e) = result {
+            self.show_key(&format!("保存エラー: {e}"));
+            return;
+        }
+        // 自分で書いたファイルの変更通知で、読み込んだばかりのキャッシュを捨てないよう記録しておく
+        if let Ok(mtime) = std::fs::metadata(&job.dst).and_then(|m| m.modified()) {
+            self.self_written.insert(job.dst.clone(), mtime);
+        }
+        // 解像度フィルター中でも、保存したファイルがすぐ一覧に入るよう解像度を先に調べておく
+        self.dim_cache.insert(job.dst.clone(), image::image_dimensions(&job.dst).ok());
+        // キャッシュを保ったまま一覧を取り直すので、元の画像の表示は途切れない
+        self.refresh_image_list(&std::collections::HashSet::new(), ctx);
+        let name = job.dst.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if self.current_file.as_ref() != Some(&job.src) || !self.images.contains(&job.dst) {
+            // 保存中に別の画像へ移っていたら切り替えない
+            self.show_key(&format!("新規保存: {name}"));
+            return;
+        }
+        self.switch_to_saved = Some(SavedSwitch { src: job.src, dst: job.dst.clone(), applied: job.applied });
+        if self.texture_cache.contains_key(&job.dst) {
+            self.finish_switch_to_saved(ctx);
+        } else if !self.loading_images.contains(&job.dst) {
+            self.spawn_decode(job.dst, ctx);
+        }
+    }
+
+    // 保存したファイルの読み込みが終わったので、表示を切り替える
+    fn finish_switch_to_saved(&mut self, ctx: &egui::Context) {
+        let Some(sw) = self.switch_to_saved.take() else {
+            return;
+        };
+        if self.current_file.as_ref() != Some(&sw.src) || !self.images.contains(&sw.dst) {
+            return;
+        }
+        // 保存したファイルは回転・反転済みなので、上書き保存と同じく
+        // 表示中は焼き込んだ分を差し引いて二重に回転しないようにする
+        self.applied_transform = Some((sw.dst.clone(), sw.applied));
+        self.set_current_index_by_path(&sw.dst);
+        self.load_current_image(ctx);
+        let name = sw.dst.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        self.show_key(&format!("新規保存: {name}"));
+    }
+
+    // 画像サイズの変更ダイアログを開く。入力欄の初期値は保留中のサイズ（なければ元の大きさ）
+    fn open_resize_dialog(&mut self) {
+        let (Some(path), Some((w, h))) = (self.current_file.clone(), self.current_image_size) else {
+            return;
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        // ダイアログを開いている間に画像が切り替わらないよう、スライドショーは止める
+        self.slide_show(false);
+        let swaps_xy = self.effective_transform().swaps_xy();
+        let to_view = |(w, h): (u32, u32)| if swaps_xy { (h, w) } else { (w, h) };
+        let original = to_view((w, h));
+        let (width, height) = to_view(self.current_resize().unwrap_or((w, h)));
+        self.resize_dialog = Some(ResizeDialog {
+            path,
+            original,
+            swaps_xy,
+            width,
+            height,
+            keep_aspect: true,
+        });
+    }
+
+    // 画像サイズの変更ダイアログを描画し、ボタン操作を処理する
+    fn show_resize_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dlg) = self.resize_dialog.as_mut() else {
+            return;
+        };
+        // フォルダ監視などで表示中の画像が変わったら閉じる
+        if self.current_file.as_ref() != Some(&dlg.path) {
+            self.resize_dialog = None;
+            return;
+        }
+
+        let mut apply = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("resize_dialog")).show(ctx, |ui| {
+            ui.heading("画像サイズの変更");
+            ui.label(format!("元のサイズ: {} x {}", dlg.original.0, dlg.original.1));
+            ui.add_space(4.0);
+            egui::Grid::new("resize_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("幅：");
+                let width_changed = ui
+                    .add(egui::DragValue::new(&mut dlg.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
+                    .changed();
+                ui.end_row();
+                ui.label("高さ：");
+                let height_changed = ui
+                    .add(egui::DragValue::new(&mut dlg.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
+                    .changed();
+                ui.end_row();
+                if dlg.keep_aspect {
+                    if width_changed {
+                        dlg.fit_height();
+                    } else if height_changed {
+                        dlg.fit_width();
+                    }
+                }
+            });
+            // 固定に切り替えた時点で、幅を基準に高さを合わせ直す
+            if ui.checkbox(&mut dlg.keep_aspect, "アスペクト比を固定").changed() && dlg.keep_aspect {
+                dlg.fit_height();
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("リサイズ").clicked() {
+                    apply = true;
+                }
+                if ui.button("リセット").clicked() {
+                    (dlg.width, dlg.height) = dlg.original;
+                }
+                if ui.button("キャンセル").clicked() {
+                    close = true;
+                }
+            });
+        });
+        // Esc やダイアログ外のクリックはキャンセル扱い
+        if modal.should_close() {
+            close = true;
+        }
+
+        if apply {
+            let dlg = self.resize_dialog.take().unwrap();
+            let size = if dlg.swaps_xy { (dlg.height, dlg.width) } else { (dlg.width, dlg.height) };
+            if (dlg.width, dlg.height) == dlg.original {
+                self.pending_resize = None;
+                self.show_key("サイズ変更を解除");
+            } else {
+                self.pending_resize = Some((dlg.path, size));
+                self.show_key(&format!("サイズ: {}x{}（Ctrl+S で保存）", dlg.width, dlg.height));
+            }
+        } else if close {
+            self.resize_dialog = None;
+        }
+    }
+
     // キーボード入力を処理する
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // リサイズウインドウの表示中は、Ctrl+S を上書き保存ではなく「リサイズして別名保存」にする。
+        // 幅・高さを入力した直後にそのまま保存できるよう、入力欄の編集中でも受け付ける
+        if self.resize_window.open && self.resize_dialog.is_none() {
+            let ctrl_s = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::S));
+            if ctrl_s {
+                self.save_resized_as_new(ctx);
+                return;
+            }
+        }
+        // ダイアログ表示中や、リサイズウインドウの入力欄を編集中は
+        // 数字入力などがショートカットとして働かないようにする
+        if self.resize_dialog.is_some() || ctx.wants_keyboard_input() {
+            return;
+        }
         // 現在のキー入力状態をまとめて取得
         struct Keys {
             ctrl: bool,
@@ -811,6 +1650,7 @@ impl App {
             end: bool,
             space: bool,
             escape: bool,
+            delete: bool,
             copy_event: bool,
             scroll_y: f32,
         }
@@ -849,6 +1689,7 @@ impl App {
             end: i.key_pressed(egui::Key::End),
             space: i.key_pressed(egui::Key::Space),
             escape: i.key_pressed(egui::Key::Escape),
+            delete: i.key_pressed(egui::Key::Delete),
             // egui-winit は Ctrl+C を Event::Copy に変換したうえで
             // Key::C のキーイベントを送出しないため、Copy イベント側で拾う
             copy_event: i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
@@ -919,6 +1760,7 @@ impl App {
         if k.f   { self.apply_menu_action(MenuAction::ToggleFilename, ctx); }
         if k.o   { self.apply_menu_action(MenuAction::ToggleSortOrder, ctx); }
         if k.f5  { self.apply_menu_action(MenuAction::Reload, ctx); }
+        if k.delete { self.apply_menu_action(MenuAction::Delete, ctx); }
 
         if k.num1 { self.rotate_image(0.0);   self.show_key("Rotate 0°"); }
         if k.num2 { self.rotate_image(90.0);  self.show_key("Rotate 90°"); }
@@ -1050,6 +1892,14 @@ impl App {
                     // ファイルはあるが読み込み中の場合
                     ui.add(egui::Spinner::new());
                     ui.label("読み込み中...");
+                } else if !self.all_images.is_empty() {
+                    // フォルダに画像はあるが、フィルターに合うものがない場合
+                    let text = if self.dim_pending.is_empty() || !self.current_filter().needs_dimensions() {
+                        "フィルターに一致する画像がありません"
+                    } else {
+                        "解像度を取得中..."
+                    };
+                    ui.label(egui::RichText::new(text).size(24.0));
                 } else {
                     // ファイルが全くない場合
                     ui.label(
@@ -1162,10 +2012,12 @@ impl eframe::App for App {
 
         self.handle_dropped_files(ctx); // ファイルドロップを処理（X11 / egui 経由）
         self.handle_keyboard(ctx);      // キーボード入力を処理
+        self.poll_fs_events(ctx);       // フォルダ内のファイル追加・削除・変更を一覧に反映
 
         // バックグラウンドスレッドからのデコード結果を処理
         // 1フレームで複数処理できるようにループさせる
         let mut decoded_any = false;
+        let mut respawn: Vec<PathBuf> = Vec::new();
         while let Ok(DecodedImage { path, generation, result }) = self.texture_receiver.try_recv() {
             decoded_any = true;
             // 読み込み中セットからパスを削除（成否によらず必ず外す）
@@ -1174,6 +2026,10 @@ impl eframe::App for App {
             // 投入後に画像リストやファイル内容が変わっていれば、この結果はもう古い。
             // 採用すると表示とキャッシュが巻き戻るため捨てる（次の update_cache が読み直す）
             if generation != self.cache_generation {
+                // 切り替え待ちのファイルは、読み直さないと切り替わらないので読み直す
+                if self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path) {
+                    respawn.push(path);
+                }
                 continue;
             }
 
@@ -1188,9 +2044,18 @@ impl eframe::App for App {
                         self.current_image_size = Some((w, h));
                     }
                     // キャッシュにテクスチャを保存
+                    let is_switch_target = self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path);
                     self.texture_cache.insert(path, texture);
+                    if is_switch_target {
+                        self.finish_switch_to_saved(ctx);
+                    }
                 }
                 Err(e) => {
+                    // 保存したファイルが読めなければ、元の画像を表示したままにする
+                    if self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path) {
+                        self.switch_to_saved = None;
+                        self.show_key(&format!("保存しましたが読み込めません: {e}"));
+                    }
                     // 現在のファイルでエラーが起きた場合のみメッセージを表示
                     if self.current_file.as_ref() == Some(&path) {
                         self.show_key(&format!("Error: {e}"));
@@ -1200,9 +2065,16 @@ impl eframe::App for App {
         }
         // デコード枠が空いたので、残りのプリフェッチを進める。
         // 同時に、別ディレクトリを開いた後に到着した古い結果をキャッシュから追い出す。
+        for path in respawn {
+            if !self.loading_images.contains(&path) && !self.texture_cache.contains_key(&path) {
+                self.spawn_decode(path, ctx);
+            }
+        }
         if decoded_any {
             self.update_cache(ctx);
         }
+        self.poll_save_job(ctx); // 「リサイズして別名保存」の完了確認
+        self.poll_dimensions(ctx); // 解像度フィルター用の解像度取得
 
         // スライドショーの更新
         if self.is_sliding {
@@ -1253,6 +2125,9 @@ impl eframe::App for App {
             let show_filename = self.show_filename;
             let has_file      = self.current_file.is_some();
             let sort_order    = self.sort_order;
+            let resize_window_open = self.resize_window.open;
+            let filter_window_open = self.filter_window_open;
+            let filter_active = self.current_filter().is_active();
 
             response.context_menu(|ui| {
                 // ラベルの右側にショートカットキーを添えたメニュー項目
@@ -1278,6 +2153,17 @@ impl eframe::App for App {
                 let sort_label = if sort_order == SortOrder::Natural { "更新日順にソート" } else { "自然順にソート" };
                 if item(ui, sort_label, "O") {
                     menu_action = Some(MenuAction::ToggleSortOrder);
+                    ui.close_menu();
+                }
+
+                // フィルター（条件が入っていればその旨を添える）
+                let filter_label = match (filter_window_open, filter_active) {
+                    (true, _) => "フィルターを閉じる",
+                    (false, true) => "フィルターを表示（絞り込み中）",
+                    (false, false) => "フィルターを表示",
+                };
+                if item(ui, filter_label, "") {
+                    menu_action = Some(MenuAction::ToggleFilterWindow);
                     ui.close_menu();
                 }
 
@@ -1313,18 +2199,34 @@ impl eframe::App for App {
                     if item(ui, "画像を270度回転", "4 / Ctrl+←") { menu_action = Some(MenuAction::Rotate(270.0)); ui.close_menu(); }
                     if item(ui, "左右反転", "X") { menu_action = Some(MenuAction::FlipHorizontal); ui.close_menu(); }
                     if item(ui, "上下反転", "Y") { menu_action = Some(MenuAction::FlipVertical);   ui.close_menu(); }
+                    if item(ui, "画像サイズの変更...", "") { menu_action = Some(MenuAction::ResizeImage); ui.close_menu(); }
+                });
+                let resize_window_label = if resize_window_open { "リサイズウインドウを閉じる" } else { "リサイズウインドウを表示" };
+                ui.add_enabled_ui(has_file, |ui| {
+                    if item(ui, resize_window_label, "") { menu_action = Some(MenuAction::ToggleResizeWindow); ui.close_menu(); }
                 });
 
                 ui.separator();
 
                 // 回転した画像の保存（画像読込済みのときのみ有効）
                 ui.add_enabled_ui(has_file, |ui| {
-                    if item(ui, "上書き保存", "Ctrl+S") {
+                    // リサイズウインドウの表示中は Ctrl+S が「リサイズして別名保存」になる
+                    if item(ui, "上書き保存", if resize_window_open { "" } else { "Ctrl+S" }) {
                         menu_action = Some(MenuAction::SaveOverwrite);
                         ui.close_menu();
                     }
                     if item(ui, "新規保存", "Ctrl+Shift+S") {
                         menu_action = Some(MenuAction::SaveAsNew);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.separator();
+
+                // 削除（画像読込済みのときのみ有効）
+                ui.add_enabled_ui(has_file, |ui| {
+                    if item(ui, "ゴミ箱へ移動", "Delete") {
+                        menu_action = Some(MenuAction::Delete);
                         ui.close_menu();
                     }
                 });
@@ -1356,6 +2258,11 @@ impl eframe::App for App {
         if let Some(action) = menu_action {
             self.apply_menu_action(action, ctx);
         }
+
+        // リサイズウインドウ（右上）と画像サイズの変更ダイアログ
+        self.show_resize_window(ctx);
+        self.show_filter_window(ctx);
+        self.show_resize_dialog(ctx);
 
         // ファイルドラッグの開始（デスクトップ環境に応じた処理、Linux のみ）
         #[cfg(target_os = "linux")]
@@ -1392,16 +2299,27 @@ impl eframe::App for App {
             }
         }
 
-        // 回転・反転オーバーレイ（左上）。回転か反転をしているときだけ表示する
-        let labels = self.transform_labels();
+        // 回転・反転・サイズ変更のオーバーレイ（左上）。いずれかをしているときだけ表示する
+        let labels = self.transform_labels(self.current_resize());
         if !labels.is_empty() {
             let mut text = labels.into_iter().map(|(l, _)| l).collect::<Vec<_>>().join(" / ");
             // 上書き保存した画像は変換済みのファイルをそのまま表示しているので、その旨を添える
-            if self.showing_applied() && self.effective_transform().is_identity() {
+            if self.showing_applied() && self.effective_transform().is_identity() && self.current_resize().is_none() {
                 text.push_str("（この画像は保存済み）");
             }
+            // 左上にフィルターウインドウが重なっていれば、その下にずらす
+            let mut offset = egui::vec2(10.0, 10.0);
+            if self.filter_window_open {
+                if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new("filter_window"))) {
+                    let screen = ctx.screen_rect();
+                    let overlay = egui::Rect::from_min_size(screen.left_top() + offset, egui::vec2(300.0, 20.0));
+                    if rect.intersects(overlay) {
+                        offset.y = rect.bottom() - screen.top() + 6.0;
+                    }
+                }
+            }
             egui::Area::new(egui::Id::new("rotation_overlay"))
-                .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+                .anchor(egui::Align2::LEFT_TOP, offset)
                 .show(ctx, |ui| {
                     // 折り返すと「回転:」と角度が2行に分かれるため、1行に固定する
                     ui.add(
@@ -1750,7 +2668,15 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-// 自然順ソート: 文字列をアルファベット部分と数字部分に分けて比較する
+// サポートしている画像の拡張子か（大文字小文字は区別しない）。
+// 削除済みのパスにも使うため、ファイルの存在は確認しない
+fn has_supported_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SUPPORTED_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+// 自然順ソート:文字列をアルファベット部分と数字部分に分けて比較する
 // 例: "file2.txt" は "file10.txt" より前に来る
 //
 // 大文字小文字とゼロ埋めの違いは無視して比較するが、それ以外が完全に同じ場合は
