@@ -4,6 +4,8 @@ use egui::{ColorImage, TextureHandle, TextureOptions}; // eguiから画像関連
 use std::path::{Path, PathBuf}; // ファイルパスを扱うための型
 use std::time::{Duration, Instant}; // 時間を扱うための型
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // macOS / Windows は OS 標準のドラッグ表示を使う
+mod drag_icon; // ファイルドラッグ時のアイコン（サムネイル＋ファイル名＋コピー/移動）
 mod filter; // ファイル名・解像度による画像の絞り込み
 mod rotate_save; // 回転画像のメタデータ保持保存
 
@@ -74,6 +76,9 @@ const MAX_CONCURRENT_DECODES: usize = 3;
 // ファイルドラッグ開始とみなすポインタ移動量 (ポイント)。ドラッグ送出は Linux / macOS のみ
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const DRAG_START_THRESHOLD: f32 = 6.0;
+// ドラッグアイコンをポインタからどれだけ右下にずらして出すか (論理ピクセル)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DRAG_ICON_OFFSET: i32 = 12;
 // 解像度フィルターの絞り込み結果を、解像度の取得中に反映し直す間隔 (ミリ秒)
 const FILTER_REAPPLY_MS: u64 = 200;
 // 解像度の取得結果をまとめて送る件数（1 件ごとに再描画を起こさないため）
@@ -154,6 +159,8 @@ struct App {
     show_filename: bool,                      // ファイル名を左下に表示するかどうか
     last_title: String,                       // 最後に送信したウィンドウタイトル（変化時のみ送るため）
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>, // テクスチャキャッシュ
+    // ドラッグアイコン用のサムネイル（テクスチャと一緒に作る。長辺 THUMBNAIL_SOURCE_SIZE）
+    thumbnail_cache: std::collections::HashMap<PathBuf, std::sync::Arc<image::RgbaImage>>,
     loading_images: std::collections::HashSet<PathBuf>, // 読み込み中の画像セット
     texture_sender: std::sync::mpsc::Sender<DecodedImage>,
     texture_receiver: std::sync::mpsc::Receiver<DecodedImage>,
@@ -260,7 +267,8 @@ struct SavedSwitch {
 struct DecodedImage {
     path: PathBuf,
     generation: u64,
-    result: Result<(ColorImage, (u32, u32)), String>,
+    // (画像, 元のサイズ, ドラッグアイコン用のサムネイル)
+    result: Result<(ColorImage, (u32, u32), image::RgbaImage), String>,
 }
 
 // App構造体の実装
@@ -307,6 +315,7 @@ impl App {
             show_filename: true,
             last_title: String::new(),
             texture_cache: std::collections::HashMap::new(),
+            thumbnail_cache: std::collections::HashMap::new(),
             loading_images: std::collections::HashSet::new(),
             texture_sender: tx,
             texture_receiver: rx,
@@ -563,6 +572,7 @@ impl App {
         // クリアすると同時実行数の計算が狂い、同じ画像を二重にデコードしてしまう。
         // 代わりに世代を進めて、走行中のデコード結果を受信時に破棄させる。
         self.texture_cache.clear();
+        self.thumbnail_cache.clear();
         self.cache_generation = self.cache_generation.wrapping_add(1);
 
         // 別のフォルダを開いたら、前のフォルダの解像度は不要なので捨てる
@@ -830,6 +840,7 @@ impl App {
 
         // 2. キャッシュ対象から外れたものをキャッシュから削除
         self.texture_cache.retain(|k, _| retain_keys.contains(k));
+        self.thumbnail_cache.retain(|k, _| retain_keys.contains(k));
 
         // 3. 新しくキャッシュ対象になった画像を、同時実行数を制限しつつ読み込む。
         //    上限に達した分は、デコード完了時に update() から再度呼ばれて続きが走る。
@@ -859,12 +870,15 @@ impl App {
             let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 image::open(&path).map(|img| {
                     let (w, h) = (img.width(), img.height());
+                    // ドラッグアイコン用。デコード済みの画像から作れば、ドラッグ開始時に読み直さずに済む
+                    let size = drag_icon::THUMBNAIL_SOURCE_SIZE;
+                    let thumbnail = img.thumbnail(size, size).to_rgba8();
                     let rgba = img.to_rgba8();
                     let color_image = ColorImage::from_rgba_unmultiplied(
                         [w as usize, h as usize],
                         rgba.as_raw(),
                     );
-                    (color_image, (w, h))
+                    (color_image, (w, h), thumbnail)
                 })
             }));
             let result = match decoded {
@@ -1895,6 +1909,15 @@ impl App {
         }
     }
 
+    // ドラッグアイコン（サムネイル＋ファイル名＋コピー/移動）。サムネイルがまだなければ None
+    #[cfg(target_os = "linux")]
+    fn drag_icon(&self, path: &Path, scale: f32, action: drag_icon::DragAction) -> Option<image::RgbaImage> {
+        let thumbnail = self.thumbnail_cache.get(path)?;
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let font = DRAG_LABEL_FONT.get().and_then(Option::as_ref);
+        Some(drag_icon::render(thumbnail, &name, font, scale, action))
+    }
+
     // 画像を描画する
     fn draw_image(&mut self, ui: &mut egui::Ui) {
         let Some(ref texture) = self.current_texture else {
@@ -2046,7 +2069,7 @@ impl eframe::App for App {
             }
 
             match result {
-                Ok((color_image, (w, h))) => {
+                Ok((color_image, (w, h), thumbnail)) => {
                     let name = path.to_string_lossy(); // テクスチャ名はユニークにする
                     let texture = ctx.load_texture(name, color_image, TextureOptions::LINEAR);
 
@@ -2057,6 +2080,8 @@ impl eframe::App for App {
                     }
                     // キャッシュにテクスチャを保存
                     let is_switch_target = self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path);
+                    // サムネイルはテクスチャと同じ時に入れ替えるので、表示中の画像とは常に一致する
+                    self.thumbnail_cache.insert(path.clone(), std::sync::Arc::new(thumbnail));
                     self.texture_cache.insert(path, texture);
                     if is_switch_target {
                         self.finish_switch_to_saved(ctx);
@@ -2281,17 +2306,28 @@ impl eframe::App for App {
         if self.pending_file_drag {
             self.pending_file_drag = false;
             if let Some(path) = self.current_file.clone() {
+                // 既定はコピー。Ctrl を押しながらドラッグすると移動
+                let ctrl = ctx.input(|i| i.modifiers.ctrl);
+                let action = if ctrl { drag_icon::DragAction::Move } else { drag_icon::DragAction::Copy };
+                let scale = ctx.pixels_per_point();
                 match self.display_server {
                     Some(DisplayServer::X11) => {
                         if let Some(win_id) = self.get_x11_window_id(frame) {
-                            std::thread::spawn(move || xdnd_drag(win_id, path));
+                            // X11 はドラッグ中に Ctrl で切り替えられるので、両方のアイコンを渡す
+                            let icons = self.drag_icon(&path, scale, drag_icon::DragAction::Copy)
+                                .zip(self.drag_icon(&path, scale, drag_icon::DragAction::Move));
+                            std::thread::spawn(move || xdnd_drag(win_id, path, icons));
                         } else {
                             eprintln!("X11 Window ID not found.");
                         }
                     }
                     Some(DisplayServer::Wayland) => {
                         match self.wayland_dnd.as_ref().and_then(|wl| wl.lock().ok()) {
-                            Some(mut wl) => wl.start_drag(&path),
+                            Some(mut wl) => {
+                                // バッファの倍率は整数。小数倍率の画面では切り上げて、コンポジターに縮小させる
+                                let icon = self.drag_icon(&path, scale.ceil(), action).map(|i| (i, scale.ceil() as i32));
+                                wl.start_drag(&path, icon, action);
+                            }
                             None => eprintln!("Wayland DnD context not initialized."),
                         }
                     }
@@ -2637,6 +2673,9 @@ fn collect_japanese_fonts(dir: &Path, depth: usize, out: &mut Vec<(usize, PathBu
 //
 // フォントが見つからない場合は egui の既定フォントのまま続行する。
 // その場合、日本語は表示できない（豆腐になる）が、起動自体は妨げない。
+// ドラッグアイコンのファイル名を描くフォント（egui と同じ日本語フォント）。見つからなければ None
+static DRAG_LABEL_FONT: std::sync::OnceLock<Option<ab_glyph::FontArc>> = std::sync::OnceLock::new();
+
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -2647,9 +2686,15 @@ fn setup_custom_fonts(ctx: &egui::Context) {
              環境変数 RVIEW_FONT にフォントファイルのパスを指定してください。\n\
              （.ttc は RVIEW_FONT=/path/to/font.ttc#0 のようにフェイス番号を指定できます）"
         );
+        let _ = DRAG_LABEL_FONT.set(None);
         ctx.set_fonts(fonts);
         return;
     };
+    let _ = DRAG_LABEL_FONT.set(
+        ab_glyph::FontVec::try_from_vec_and_index(font.bytes.clone(), font.index)
+            .ok()
+            .map(ab_glyph::FontArc::new),
+    );
 
     fonts.font_data.insert(
         "my_font".to_owned(),
@@ -3097,6 +3142,7 @@ struct XdndAtoms {
     xdnd_finished:    u32,
     xdnd_selection:   u32,
     xdnd_action_copy: u32,
+    xdnd_action_move: u32,
     uri_list:         u32,  // "text/uri-list"
 }
 
@@ -3119,6 +3165,7 @@ fn intern_xdnd_atoms(conn: &x11rb::rust_connection::RustConnection)
         xdnd_finished:    atom!("XdndFinished"),
         xdnd_selection:   atom!("XdndSelection"),
         xdnd_action_copy: atom!("XdndActionCopy"),
+        xdnd_action_move: atom!("XdndActionMove"),
         uri_list:         atom!("text/uri-list"),
     })
 }
@@ -3201,7 +3248,11 @@ fn xdnd_reply_selection(
 ///   3. ポーリングループ：カーソル追跡 → XdndEnter/Position/Leave 送信
 ///   4. マウスボタン離した瞬間に XdndDrop または XdndLeave 送信
 ///   5. XdndFinished 受信で終了
-fn xdnd_drag(src_window: u32, file_path: PathBuf) {
+///
+/// 既定はコピー、Ctrl を押している間は移動として XdndPosition を送る。
+/// `icons` は (コピー時, 移動時) のドラッグアイコン。ポインタに付いて動く小さなウインドウで表示する
+/// （X11 には Wayland のようなドラッグアイコンの仕組みがないため）
+fn xdnd_drag(src_window: u32, file_path: PathBuf, icons: Option<(image::RgbaImage, image::RgbaImage)>) {
     use x11rb::protocol::{xproto::{ConnectionExt as _, PropMode, AtomEnum}, Event as XEvent};
     use x11rb::wrapper::ConnectionExt as _;
     use x11rb::rust_connection::RustConnection;
@@ -3247,6 +3298,61 @@ fn xdnd_drag(src_window: u32, file_path: PathBuf) {
 
     let Ok(atoms) = intern_xdnd_atoms(&conn) else { return; };
 
+    // ドラッグアイコン用のウインドウ。この関数を抜けるときに破棄する
+    struct IconWindow<'a, C: Connection> {
+        conn: &'a C,
+        window: u32,
+        gc: u32,
+        size: (u16, u16),
+        images: [Vec<u8>; 2], // [コピー, 移動] の B, G, R, X
+        depth: u8,
+    }
+    impl<'a, C: Connection> IconWindow<'a, C> {
+        fn draw(&self, action_move: bool) {
+            let _ = self.conn.put_image(
+                x11rb::protocol::xproto::ImageFormat::Z_PIXMAP,
+                self.window, self.gc, self.size.0, self.size.1, 0, 0, 0, self.depth,
+                &self.images[action_move as usize],
+            );
+        }
+    }
+    impl<'a, C: Connection> Drop for IconWindow<'a, C> {
+        fn drop(&mut self) {
+            let _ = self.conn.free_gc(self.gc);
+            let _ = self.conn.destroy_window(self.window);
+            let _ = self.conn.flush();
+        }
+    }
+    let screen = &conn.setup().roots[0];
+    // 24 ビット TrueColor の画面だけ対応する（それ以外は画素の並びが違うのでアイコンなし）
+    let icon_window = icons.filter(|_| screen.root_depth == 24).and_then(|(copy, mv)| {
+        if copy.dimensions() != mv.dimensions() {
+            return None;
+        }
+        let (w, h) = copy.dimensions();
+        let window = conn.generate_id().ok()?;
+        let gc = conn.generate_id().ok()?;
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT, window, screen.root,
+            0, 0, w as u16, h as u16, 0,
+            x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT, x11rb::COPY_FROM_PARENT,
+            // ウインドウマネージャーに管理させない（枠を付けず、フォーカスも移さない）
+            &CreateWindowAux::new().override_redirect(1).background_pixel(screen.black_pixel),
+        ).ok()?;
+        conn.create_gc(gc, window, &x11rb::protocol::xproto::CreateGCAux::new()).ok()?;
+        let bg = [40, 40, 40];
+        Some(IconWindow {
+            conn: &conn,
+            window,
+            gc,
+            size: (w as u16, h as u16),
+            images: [drag_icon::to_opaque_bgrx(&copy, bg), drag_icon::to_opaque_bgrx(&mv, bg)],
+            depth: screen.root_depth,
+        })
+    });
+    let mut icon_mapped = false;
+    let mut last_icon_state: Option<(i16, i16, bool)> = None;
+
     // ダミーウィンドウを作成してドラッグ元とする
     // (src_windowの所有権は別スレッド(winit)にあるため、SelectionRequestを受け取れない)
     let root = conn.setup().roots[0].root;
@@ -3290,8 +3396,34 @@ fn xdnd_drag(src_window: u32, file_path: PathBuf) {
         let Some(ptr) = conn.query_pointer(src_window).ok().and_then(|c| c.reply().ok()) else { break; };
         let btn_down = u16::from(ptr.mask) & 0x100 != 0; // Button1Mask
 
+        // 既定はコピー。Ctrl を押している間は移動
+        let action_move = u16::from(ptr.mask) & 0x4 != 0; // ControlMask
+        let action = if action_move { atoms.xdnd_action_move } else { atoms.xdnd_action_copy };
+
+        // ドラッグアイコンをポインタの右下に追従させ、コピー / 移動が変わったら描き直す
+        if let Some(icon) = &icon_window {
+            let state = (ptr.root_x, ptr.root_y, action_move);
+            if last_icon_state != Some(state) {
+                let _ = conn.configure_window(
+                    icon.window,
+                    &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                        .x(ptr.root_x as i32 + DRAG_ICON_OFFSET)
+                        .y(ptr.root_y as i32 + DRAG_ICON_OFFSET)
+                        .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+                );
+                if !icon_mapped {
+                    let _ = conn.map_window(icon.window);
+                    icon_mapped = true;
+                }
+                // 移動のたびに描き直す（マップ直後や他の窓に隠された後でも消えたままにならないように）
+                icon.draw(action_move);
+                last_icon_state = Some(state);
+            }
+        }
+
         // カーソル下の XdndAware ウィンドウを探す
-        let new_target = find_xdnd_target(&conn, ptr.root, &[dummy_window, src_window], &atoms);
+        let icon_id = icon_window.as_ref().map_or(0, |i| i.window);
+        let new_target = find_xdnd_target(&conn, ptr.root, &[dummy_window, src_window, icon_id], &atoms);
 
         if new_target != cur_target {
             if cur_target != 0 {
@@ -3311,7 +3443,7 @@ fn xdnd_drag(src_window: u32, file_path: PathBuf) {
             // 現在位置を通知
             let pos = ((ptr.root_x as u16 as u32) << 16) | (ptr.root_y as u16 as u32);
             xdnd_send(&conn, cur_target, atoms.xdnd_position,
-                      [dummy_window, 0, pos, 0, atoms.xdnd_action_copy]);
+                      [dummy_window, 0, pos, 0, action]);
         }
 
         // 受信イベントを処理（ノンブロッキング）
@@ -3399,7 +3531,7 @@ fn xdnd_drag(src_window: u32, file_path: PathBuf) {
 use wayland_client::protocol::{
     wl_registry, wl_seat, wl_pointer,
     wl_data_device, wl_data_device_manager, wl_data_source,
-    wl_data_offer, wl_surface, wl_compositor, wl_shm, wl_buffer,
+    wl_data_offer, wl_surface, wl_compositor, wl_shm, wl_shm_pool, wl_buffer,
 };
 #[cfg(target_os = "linux")]
 use wayland_client::{Connection as WlConnection, Dispatch as WlDispatch, QueueHandle as WlQueueHandle, Proxy};
@@ -3418,6 +3550,8 @@ struct WaylandDndState {
     drag_active: bool,          // ドラッグ操作中かどうか
     drag_source: Option<wl_data_source::WlDataSource>, // ドラッグ中のデータソース
     drag_icon_surface: Option<wl_surface::WlSurface>, // ドラッグ中のアイコンサーフェス
+    // サムネイルのドラッグアイコンのバッファと、その画素を置いた共有メモリ（ドラッグ終了まで保持する）
+    drag_icon_buffer: Option<(wl_buffer::WlBuffer, std::fs::File)>,
     // ドラッグ開始後にポインタのボタン解放を観測した時刻。
     // DnD grab が成立するとコンポジターは wl_pointer のイベント送出を止めるため、
     // ここに時刻が入る＝start_drag が受理されなかった可能性が高い
@@ -3539,6 +3673,7 @@ impl WaylandDndContext {
             drag_active: false,
             drag_source: None,
             drag_icon_surface: None,
+            drag_icon_buffer: None,
             drag_release_at: None,
             current_offer: None,
             offer_has_uri_list: false,
@@ -3665,7 +3800,10 @@ impl WaylandDndContext {
     }
 
     /// ドラッグ操作を開始する
-    fn start_drag(&mut self, file_path: &Path) {
+    /// `icon` は (ドラッグアイコンの画像, 画面の整数倍率)。なければ掴む手のカーソルを使う。
+    /// `action` は受け手に許可する操作。Wayland では start_drag の前に一度しか指定できないため、
+    /// ドラッグ開始時に決める（ドラッグ中に Ctrl を押し直しても切り替わらない）
+    fn start_drag(&mut self, file_path: &Path, icon: Option<(image::RgbaImage, i32)>, action: drag_icon::DragAction) {
         if self.state.data_device_manager.is_none() || self.state.data_device.is_none() {
             return;
         }
@@ -3692,18 +3830,24 @@ impl WaylandDndContext {
             .unwrap_or_else(|_| format!("file://{}", file_path.display()));
         self.state.drag_uri = Some(format!("{}\r\n", uri_str));
 
-        // ドラッグアイコン用のサーフェスを作成（掴んでいる手のカーソル）
+        // ドラッグアイコン用のサーフェスを作成（サムネイル。作れなければ掴んでいる手のカーソル）
         let qh = self.event_queue.handle();
-        let icon_surface = self.create_drag_icon_surface(&qh);
+        let icon_surface = icon
+            .and_then(|(img, scale)| self.create_image_icon_surface(&qh, &img, scale))
+            .or_else(|| self.create_drag_icon_surface(&qh));
 
         // データソースを作成し、text/uri-list を提供する
         let mgr = self.state.data_device_manager.as_ref().unwrap();
         let source = mgr.create_data_source(&qh, ());
         source.offer("text/uri-list".to_string());
         // サポートするアクションを宣言（これがないとコンポジターがアクション交渉できずドロップが失敗する）。
-        // Move は宣言しない：受け手が Move を選ぶと元ファイルの削除はドラッグ元の責務になるが、
-        // 画像ビューワが勝手にファイルを消すべきではないため Copy のみを提供する。
-        source.set_actions(wl_data_device_manager::DndAction::Copy);
+        // Copy と Move を両方宣言すると、コンポジター（GNOME は Ctrl でコピー・Shift で移動）や
+        // 受け手（同じドライブなら移動を好むファイルマネージャー）が移動を選んでしまうため、どちらか一方だけにする。
+        // 移動のときもファイルの移動は受け手（ファイルマネージャー）が行う。ドラッグ元では元ファイルを消さない
+        source.set_actions(match action {
+            drag_icon::DragAction::Copy => wl_data_device_manager::DndAction::Copy,
+            drag_icon::DragAction::Move => wl_data_device_manager::DndAction::Move,
+        });
 
         // ドラッグを開始
         let device = self.state.data_device.as_ref().unwrap();
@@ -3713,6 +3857,11 @@ impl WaylandDndContext {
             icon_surface.as_ref(),
             self.state.last_button_serial,
         );
+        // アイコンの内容とずれは、start_drag でドラッグアイコンの役割が付いた後に commit する。
+        // 役割が付く前に commit すると、mutter（GNOME）はその内容を表示しないことがある
+        if let Some(icon) = &icon_surface {
+            icon.commit();
+        }
 
         self.state.drag_icon_surface = icon_surface;
         self.state.drag_source = Some(source);
@@ -3735,6 +3884,9 @@ impl WaylandDndContext {
         self.state.drag_uri = None;
         if let Some(icon) = self.state.drag_icon_surface.take() {
             icon.destroy();
+        }
+        if let Some((buffer, _file)) = self.state.drag_icon_buffer.take() {
+            buffer.destroy();
         }
         if let Some(source) = self.state.drag_source.take() {
             source.destroy();
@@ -3777,6 +3929,44 @@ impl WaylandDndContext {
         }
     }
 
+    /// 画像 `img`（ストレートアルファの RGBA、`scale` 倍の解像度）を貼ったドラッグアイコン用サーフェスを作る
+    fn create_image_icon_surface(
+        &mut self,
+        qh: &WlQueueHandle<WaylandDndState>,
+        img: &image::RgbaImage,
+        scale: i32,
+    ) -> Option<wl_surface::WlSurface> {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        let compositor = self.state.compositor.as_ref()?;
+        let shm = self.state.shm.as_ref()?;
+        let surface = compositor.create_surface(qh, ());
+        // set_buffer_scale は wl_surface v3 から。バッファの幅・高さは倍率の倍数でなければならない
+        let scale = if surface.version() >= 3 { scale.max(1) } else { 1 };
+        let pad = |v: u32| v.div_ceil(scale as u32) * scale as u32;
+        let (w, h) = (pad(img.width()), pad(img.height()));
+        let mut canvas = image::RgbaImage::new(w, h);
+        image::imageops::overlay(&mut canvas, img, 0, 0);
+
+        let stride = w * 4;
+        let size = (stride * h) as usize;
+        let mut file = create_shm_file(size)?;
+        file.write_all(&drag_icon::to_premultiplied_bgra(&canvas)).ok()?;
+        let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
+        let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, wl_shm::Format::Argb8888, qh, ());
+        pool.destroy(); // プールを破棄してもバッファは使える
+
+        if scale > 1 {
+            surface.set_buffer_scale(scale);
+        }
+        // ポインタの右下に出す（attach の x, y はサーフェス座標＝論理ピクセルでのずれ）
+        surface.attach(Some(&buffer), DRAG_ICON_OFFSET, DRAG_ICON_OFFSET);
+        surface.damage(0, 0, i32::MAX, i32::MAX);
+        // commit は start_drag の後で行う（役割が付く前の内容は使われないことがある）
+        self.state.drag_icon_buffer = Some((buffer, file));
+        Some(surface)
+    }
+
     /// カーソルテーマから "grabbing" カーソルを読み込み、ドラッグアイコン用サーフェスを作成する
     fn create_drag_icon_surface(&mut self, qh: &WlQueueHandle<WaylandDndState>) -> Option<wl_surface::WlSurface> {
         if self.state.compositor.is_none() {
@@ -3803,7 +3993,7 @@ impl WaylandDndContext {
         let compositor = self.state.compositor.as_ref().unwrap();
         let surface = compositor.create_surface(qh, ());
         surface.attach(Some(&**cursor_image), -(hotspot_x as i32), -(hotspot_y as i32));
-        surface.commit();
+        // commit は start_drag の後で行う
 
         Some(surface)
     }
@@ -4061,6 +4251,16 @@ impl WlDispatch<wl_data_source::WlDataSource, ()> for WaylandDndState {
                 if let Some(icon) = state.drag_icon_surface.take() {
                     icon.destroy();
                 }
+                if let Some((buffer, _file)) = state.drag_icon_buffer.take() {
+                    buffer.destroy();
+                }
+            }
+            wl_data_source::Event::Action { dnd_action } => {
+                // コンポジターが受け手と交渉して決めた操作。コピーなのにファイルが移動された場合は、
+                // 受け手（ファイラー）がこの決定を守っていないと切り分けられる
+                if dnd_debug() {
+                    eprintln!("[rview-dnd] negotiated action={dnd_action:?}");
+                }
             }
             _ => {}
         }
@@ -4130,6 +4330,39 @@ impl WlDispatch<wl_shm::WlShm, ()> for WaylandDndState {
 
 // wl_buffer: カーソル画像バッファ用
 #[cfg(target_os = "linux")]
+// wl_shm_pool: イベントなし（ドラッグアイコンのバッファ作成に使用）
+#[cfg(target_os = "linux")]
+impl WlDispatch<wl_shm_pool::WlShmPool, ()> for WaylandDndState {
+    fn event(
+        _state: &mut Self,
+        _pool: &wl_shm_pool::WlShmPool,
+        _event: wl_shm_pool::Event,
+        _data: &(),
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+    ) {
+    }
+}
+
+/// コンポジターと共有するメモリ用の、名前のない一時ファイルを作る（作成直後に削除する）
+#[cfg(target_os = "linux")]
+fn create_shm_file(size: usize) -> Option<std::fs::File> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    for n in 0..100 {
+        let path = dir.join(format!("rview-dnd-icon-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                file.set_len(size as u64).ok()?;
+                return Some(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 impl WlDispatch<wl_buffer::WlBuffer, ()> for WaylandDndState {
     fn event(
         _state: &mut Self,
