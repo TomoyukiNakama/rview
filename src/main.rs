@@ -1321,17 +1321,25 @@ impl App {
                     None => "表示中の画像: なし".to_string(),
                 });
                 ui.add_space(4.0);
+                // Enter で入力を確定したら、次の入力欄（幅 → 高さ → チェックボックス）へフォーカスを移す
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter_pressed = |r: &egui::Response| enter && r.lost_focus();
+                let mut focus_aspect = false;
                 egui::Grid::new("resize_window_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("幅：");
-                    let width_changed = ui
-                        .add(egui::DragValue::new(&mut rw.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
-                        .changed();
+                    let width_resp =
+                        ui.add(egui::DragValue::new(&mut rw.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"));
+                    let width_changed = width_resp.changed();
                     ui.end_row();
                     ui.label("高さ：");
-                    let height_changed = ui
-                        .add(egui::DragValue::new(&mut rw.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
-                        .changed();
+                    let height_resp =
+                        ui.add(egui::DragValue::new(&mut rw.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"));
+                    let height_changed = height_resp.changed();
                     ui.end_row();
+                    if enter_pressed(&width_resp) {
+                        height_resp.request_focus();
+                    }
+                    focus_aspect = enter_pressed(&height_resp);
                     // 固定中は、表示中の画像の縦横比でもう一方を合わせる
                     if let (true, Some((vw, vh))) = (rw.keep_aspect, view_size) {
                         let scaled = |v: u32, num: u32, den: u32| {
@@ -1344,8 +1352,12 @@ impl App {
                         }
                     }
                 });
-                ui.checkbox(&mut rw.keep_aspect, "アスペクト比を固定")
+                let aspect_resp = ui
+                    .checkbox(&mut rw.keep_aspect, "アスペクト比を固定")
                     .on_hover_text("オンにすると、各画像の縦横比を保ったまま 幅 x 高さ に収まる大きさで保存します");
+                if focus_aspect {
+                    aspect_resp.request_focus();
+                }
                 if rw.keep_aspect {
                     if let Some(size) = view_size {
                         let (w, h) = rw.target_size(size);
@@ -1994,7 +2006,7 @@ impl eframe::App for App {
                 let mut drops: Vec<PathBuf> = Vec::new();
                 if let Some(ref wl) = self.wayland_dnd {
                     if let Ok(mut wl) = wl.lock() {
-                        wl.dispatch_pending();
+                        wl.dispatch_queued();
                         wl.expire_stale_drag();
                         wl.complete_pending_drops();
                         drops.extend(wl.state.received_drops.drain(..));
@@ -3580,26 +3592,15 @@ impl WaylandDndContext {
     }
 
     /// 既にキューへ積まれているイベントだけを処理する（ソケットからは読まない）。
-    /// 監視スレッドから呼ぶ用。読み取りまで行うと winit がイベントを取りこぼす。
+    ///
+    /// ソケットの読み取りは winit が常に行っており、読んだイベントはこのキューにも振り分けられる。
+    /// 自分で prepare_read → read してはいけない。read は同じ接続で読み取り準備中の全員
+    /// （winit・NVIDIA EGL など）が読み終えるまで待つため、winit が読み取り準備を持ったまま
+    /// update() を呼んだときに永久に止まる（起動直後に起きると最初のフレームが描かれず、
+    /// ウインドウが表示されないまま最小化されたように見える）
     fn dispatch_queued(&mut self) {
         let _ = self.event_queue.dispatch_pending(&mut self.state);
         // ディスパッチ中に送出した accept / set_actions / receive を即座に届ける
-        let _ = self.conn.flush();
-    }
-
-    /// 保留中のイベントをディスパッチする
-    fn dispatch_pending(&mut self) {
-        // まず既にキューにあるイベントを処理
-        let _ = self.event_queue.dispatch_pending(&mut self.state);
-        // ソケットからの新しいイベントを能動的に読み取る
-        // （DnD セッション中は winit がイベントを読み取らない場合があるため）
-        let _ = self.conn.flush();
-        if let Some(guard) = self.event_queue.prepare_read() {
-            let _ = guard.read();
-        }
-        let _ = self.event_queue.dispatch_pending(&mut self.state);
-        // ディスパッチ中に送出したリクエスト（accept / set_actions / receive など）を
-        // 即座にコンポジターへ送る。遅延すると KWin がドロップをタイムアウトさせる。
         let _ = self.conn.flush();
     }
 
@@ -3676,7 +3677,8 @@ impl WaylandDndContext {
         // 直前のイベントを取り込んで押下シリアルを最新にする。
         // start_drag のシリアルが現在の implicit grab のものと一致しないと、
         // コンポジターはエラーも返さずに要求を捨てる（ドラッグが始まらない）。
-        self.dispatch_pending();
+        // （押下イベントは winit が読んだ時点でこのキューにも届いている）
+        self.dispatch_queued();
 
         // 前回のドラッグの残骸を確実に片付ける。
         // 無視された start_drag には cancelled も dnd_finished も返ってこないため、
