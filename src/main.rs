@@ -9,6 +9,13 @@ mod drag_icon; // ファイルドラッグ時のアイコン（サムネイル�
 mod filter; // ファイル名・解像度による画像の絞り込み
 mod rotate_save; // 回転画像のメタデータ保持保存
 
+// 画像の表示方法
+#[derive(PartialEq, Clone, Copy)]
+enum ViewMode {
+    FitWindow, // ウインドウに収まるよう拡大・縮小する
+    Actual,    // 等倍（画像の 1 px を画面の 1 物理ピクセル）。はみ出した分は中ボタンドラッグでスクロール
+}
+
 // ソート順を定義する列挙型
 #[derive(PartialEq, Clone, Copy)]
 enum SortOrder {
@@ -46,6 +53,7 @@ enum MenuAction {
     Delete,             // 現在の画像をゴミ箱へ移動
     Reload,            // 現在の画像を再読み込み
     ResizeWindow,       // 画像のサイズに合わせてウインドウをリサイズ
+    SetViewMode(ViewMode), // 等倍で表示／ウインドウサイズで表示
     Quit,               // アプリケーションを終了
 }
 
@@ -69,10 +77,14 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[  // サポートする画像ファイ�
 // デコード済み画像は非圧縮 RGBA で保持されるため（4000x3000 で約 48MB/枚）、
 // 大きすぎるとメモリと VRAM を食い潰す。前後 8 枚 = 最大 17 枚を上限とする。
 const CACHE_SIZE: usize = 8;
-// 同時に走らせるデコードスレッドの上限。
+// 画像を送る方向が決まっているときは、合計枚数（17 枚）を変えずに進む方向を多めに先読みする
+const CACHE_AHEAD: usize = 12;
+const CACHE_BEHIND: usize = 4;
+// 同時に走らせるデコードスレッドの上限（CPU 数の半分を、この範囲に収める）。
 // 一度に全キャッシュ対象を spawn するとメモリと CPU が飽和し、
 // 表示すべき画像のデコードが後回しになるため制限する。
-const MAX_CONCURRENT_DECODES: usize = 3;
+const MIN_CONCURRENT_DECODES: usize = 3;
+const MAX_CONCURRENT_DECODES: usize = 8;
 // ファイルドラッグ開始とみなすポインタ移動量 (ポイント)。ドラッグ送出は Linux / macOS のみ
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const DRAG_START_THRESHOLD: f32 = 6.0;
@@ -123,6 +135,7 @@ struct App {
     all_images: Vec<PathBuf>,                 // ディレクトリ内の全画像ファイル（フィルター適用前）
     filter_input: filter::FilterInput,        // フィルターウインドウの入力値（閉じても保持し、条件も有効のまま）
     filter_window_open: bool,                 // フィルターウインドウを表示しているか
+    filter_focus_pending: bool,               // 次に描くとき、ファイル名の入力欄にフォーカスを移す
     // 解像度フィルター用の画像の (幅, 高さ)。None は読めなかった画像。ヘッダだけ読むので軽い
     dim_cache: std::collections::HashMap<PathBuf, Option<(u32, u32)>>,
     dim_pending: std::collections::HashSet<PathBuf>, // 解像度を取得中の画像
@@ -148,6 +161,7 @@ struct App {
     save_job: Option<SaveJob>,                // バックグラウンドで実行中の「リサイズして別名保存」
     save_queue: std::collections::VecDeque<SaveRequest>, // 実行待ちの「リサイズして別名保存」（受け付け順に 1 件ずつ実行）
     switch_to_saved: Option<SavedSwitch>,     // 保存完了後、読み込みを待って表示を切り替える先
+    fit_window_pending: Option<PathBuf>,      // ドロップ後、読み込みを待ってウインドウを合わせる画像
     // 自分で書き込んだファイルと、そのときの更新日時。フォルダ監視の変更通知のうち、
     // 内容が書き込んだときのままのものはキャッシュを捨てない（切り替え直後に「読み込み中」が挟まるのを防ぐ）
     self_written: std::collections::HashMap<PathBuf, std::time::SystemTime>,
@@ -162,6 +176,10 @@ struct App {
     // ドラッグアイコン用のサムネイル（テクスチャと一緒に作る。長辺 THUMBNAIL_SOURCE_SIZE）
     thumbnail_cache: std::collections::HashMap<PathBuf, std::sync::Arc<image::RgbaImage>>,
     loading_images: std::collections::HashSet<PathBuf>, // 読み込み中の画像セット
+    cache_window: std::collections::HashSet<PathBuf>, // キャッシュ対象（表示中の画像と先読みの範囲）
+    decode_limit: usize,                               // 同時に走らせるデコードの上限
+    browse_direction: isize,                           // 直前に画像を送った向き（1: 次, -1: 前, 0: 不明）
+    placeholder_texture: Option<TextureHandle>,        // 表示する画像の読み込み中に、代わりに出しておく直前の画像
     texture_sender: std::sync::mpsc::Sender<DecodedImage>,
     texture_receiver: std::sync::mpsc::Receiver<DecodedImage>,
     cache_generation: u64,                    // 画像リスト／ファイル内容が変わるたびに増える
@@ -175,6 +193,9 @@ struct App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     file_drag_triggered: bool,    // 現在のドラッグジェスチャで既に DnD を起動したか
     sort_order: SortOrder,        // 画像リストのソート順
+    view_mode: ViewMode,          // 画像の表示方法（画像を切り替えても引き継ぐ）
+    pan: egui::Vec2,              // 等倍表示でのスクロール量（画像中心の、表示領域中心からのずれ）
+    pan_file: Option<PathBuf>,    // pan が対象とする画像。別の画像に移ったら中央に戻す
     // フォルダ監視。表示中のディレクトリへのファイル追加・削除・変更を検知して一覧を更新する
     watcher: Option<notify::RecommendedWatcher>,  // 監視中のウォッチャー（drop で監視停止）
     watched_dir: Option<PathBuf>,                 // 監視中のディレクトリ
@@ -287,6 +308,7 @@ impl App {
             all_images: Vec::new(),
             filter_input: filter::FilterInput::default(),
             filter_window_open: false,
+            filter_focus_pending: false,
             dim_cache: std::collections::HashMap::new(),
             dim_pending: std::collections::HashSet::new(),
             dim_sender: dim_tx,
@@ -306,6 +328,7 @@ impl App {
             save_job: None,
             save_queue: std::collections::VecDeque::new(),
             switch_to_saved: None,
+            fit_window_pending: None,
             self_written: std::collections::HashMap::new(),
             key_overlay_text: String::new(),
             key_overlay_hide_at: None,
@@ -317,6 +340,12 @@ impl App {
             texture_cache: std::collections::HashMap::new(),
             thumbnail_cache: std::collections::HashMap::new(),
             loading_images: std::collections::HashSet::new(),
+            cache_window: std::collections::HashSet::new(),
+            decode_limit: std::thread::available_parallelism()
+                .map_or(MIN_CONCURRENT_DECODES, |n| n.get() / 2)
+                .clamp(MIN_CONCURRENT_DECODES, MAX_CONCURRENT_DECODES),
+            browse_direction: 0,
+            placeholder_texture: None,
             texture_sender: tx,
             texture_receiver: rx,
             cache_generation: 0,
@@ -330,6 +359,9 @@ impl App {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             file_drag_triggered: false,
             sort_order: SortOrder::Natural,
+            view_mode: ViewMode::FitWindow,
+            pan: egui::Vec2::ZERO,
+            pan_file: None,
             watcher: None,
             watched_dir: None,
             fs_event_sender: fs_tx,
@@ -462,6 +494,7 @@ impl App {
         let (matched, total, scanning) = (self.images.len(), self.all_images.len(), self.dim_pending.len());
         let needs_dims = before.needs_dimensions();
         let mut close = false;
+        let focus_name = std::mem::take(&mut self.filter_focus_pending);
         let input = &mut self.filter_input;
         egui::Window::new("フィルター")
             .id(egui::Id::new("filter_window"))
@@ -471,6 +504,8 @@ impl App {
             .default_pos(ctx.screen_rect().left_top() + egui::vec2(10.0, 10.0))
             .movable(true)
             .title_bar(false)
+            // ドロップシャドウは付けない（枠線と背景はテーマのまま）
+            .frame(egui::Frame::window(&ctx.style()).shadow(egui::Shadow::NONE))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
@@ -479,12 +514,15 @@ impl App {
                 };
                 egui::Grid::new("filter_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("ファイル名：");
-                    ui.add(
+                    let name = ui.add(
                         egui::TextEdit::singleline(&mut input.name)
                             .desired_width(180.0)
                             .hint_text("例: cat  *.png"),
                     )
                     .on_hover_text("部分一致（大文字小文字は区別しない）。空白で区切ると AND、* と ? はワイルドカード");
+                    if focus_name {
+                        name.request_focus(); // 開いてすぐ入力できるようにする
+                    }
                     ui.end_row();
                     ui.label("幅：");
                     ui.horizontal(|ui| {
@@ -740,12 +778,16 @@ impl App {
         // まずキャッシュからテクスチャを探す
         if let Some(texture) = self.texture_cache.get(&path) {
             self.current_texture = Some(texture.clone());
+            self.placeholder_texture = None;
             // キャッシュされたテクスチャからサイズを取得
             let size = texture.size();
             self.current_image_size = Some((size[0] as u32, size[1] as u32));
         } else {
-            // キャッシュにない場合は、現在のテクスチャを一旦クリアして読み込み中を示す
-            self.current_texture = None;
+            // キャッシュにない場合は読み込み中にする。スピナーに置き換えるとちらつくので、
+            // 読み込めるまでは直前の画像を代わりに表示しておく（続けて送ったときは最初の画像のまま）
+            if let Some(prev) = self.current_texture.take() {
+                self.placeholder_texture = Some(prev);
+            }
             self.current_image_size = None;
         }
 
@@ -758,6 +800,7 @@ impl App {
         if self.images.is_empty() {
             return;
         }
+        self.browse_direction = if is_next { 1 } else { -1 };
         if is_next {
             // 次の画像へ (末尾の次は先頭)
             self.current_index = (self.current_index + 1) % self.images.len();
@@ -795,6 +838,7 @@ impl App {
         if self.images.is_empty() {
             return;
         }
+        self.browse_direction = -1;
         self.current_index = self.current_index.saturating_sub(PAGE_JUMP_COUNT); // 0未満にならないように
         self.load_current_image(ctx);
     }
@@ -804,6 +848,7 @@ impl App {
         if self.images.is_empty() {
             return;
         }
+        self.browse_direction = 1;
         self.current_index =
             (self.current_index + PAGE_JUMP_COUNT).min(self.images.len() - 1); // 配列の範囲を超えないように
         self.load_current_image(ctx);
@@ -821,15 +866,10 @@ impl App {
         // 1. 現在の画像と前後CACHE_SIZE枚をキャッシュ対象とする。
         //    現在位置に近い順（0, +1, -1, +2, -2, ...）に並べることで、
         //    デコードの優先度が表示中の画像から順になるようにする。
+        //    画像を送る向きが分かっていれば、その向きを多めに（後ろ 1 枚につき前 2 枚の順で）積む。
         let mut retain_keys = std::collections::HashSet::new();
         let mut prefetch_order: Vec<PathBuf> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
-        let mut offsets: Vec<isize> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
-        offsets.push(0);
-        for d in 1..=CACHE_SIZE as isize {
-            offsets.push(d);
-            offsets.push(-d);
-        }
-        for offset in offsets {
+        for offset in prefetch_offsets(self.browse_direction) {
             let index = (current_index as isize + offset).rem_euclid(image_count) as usize;
             let path = self.images[index].clone();
             // 画像枚数がキャッシュ幅より少ない場合は同じパスが重複するため、初回のみ積む
@@ -841,10 +881,22 @@ impl App {
         // 2. キャッシュ対象から外れたものをキャッシュから削除
         self.texture_cache.retain(|k, _| retain_keys.contains(k));
         self.thumbnail_cache.retain(|k, _| retain_keys.contains(k));
+        self.cache_window = retain_keys;
 
-        // 3. 新しくキャッシュ対象になった画像を、同時実行数を制限しつつ読み込む。
+        // 3. 表示する画像は、同時実行数の上限に達していてもすぐに読み込み始める。
+        //    素早く送ったときに、通り過ぎた画像の先読みが終わるのを待たされないようにするため。
+        //    ただしキーを押し続けたときにスレッドとメモリが際限なく増えないよう、上限の 2 倍までにする
+        let current = &prefetch_order[0];
+        if !self.texture_cache.contains_key(current)
+            && !self.loading_images.contains(current)
+            && self.loading_images.len() < self.decode_limit * 2
+        {
+            self.spawn_decode(current.clone(), ctx);
+        }
+
+        // 4. 新しくキャッシュ対象になった画像を、同時実行数を制限しつつ読み込む。
         //    上限に達した分は、デコード完了時に update() から再度呼ばれて続きが走る。
-        let mut budget = MAX_CONCURRENT_DECODES.saturating_sub(self.loading_images.len());
+        let mut budget = self.decode_limit.saturating_sub(self.loading_images.len());
         for path in prefetch_order {
             if budget == 0 {
                 break;
@@ -1174,6 +1226,51 @@ impl App {
             self.init_images(&dir, Some(path), ctx);
             // ドロップ時はスライドショーを自動開始しない（表示するだけ）
         }
+        // 最初に表示する画像の読み込みを待って、ウインドウをその大きさに合わせる
+        self.fit_window_pending = self.current_file.clone();
+    }
+
+    // ドロップした画像が読み込めたら、ウインドウをその大きさに合わせる（1 回だけ）
+    fn fit_window_after_drop(&mut self, ctx: &egui::Context) {
+        let Some(ref pending) = self.fit_window_pending else { return };
+        // 読み込み前に別の画像へ移ったら、合わせるのはやめる
+        if self.current_file.as_ref() != Some(pending) {
+            self.fit_window_pending = None;
+            return;
+        }
+        if self.current_image_size.is_none() {
+            return; // まだ読み込み中
+        }
+        self.fit_window_pending = None;
+        // 全画面表示はそのままにする。最大化中は大きさを変えられないので解除してから合わせる
+        let (fullscreen, maximized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.fullscreen.unwrap_or(false), v.maximized.unwrap_or(false))
+        });
+        if fullscreen {
+            return;
+        }
+        if maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        self.fit_window_to_image(ctx);
+    }
+
+    // ウインドウの大きさを表示中の画像（回転・反転後の向き）に合わせる。
+    // 画像がモニタより大きいとウインドウが画面外へはみ出すので、アスペクト比を保って収める
+    fn fit_window_to_image(&self, ctx: &egui::Context) -> bool {
+        let Some((w, h)) = self.current_view_size() else { return false };
+        // 等倍表示と同じく、画像の 1 px を画面の 1 物理ピクセルとする
+        let mut size = egui::vec2(w as f32, h as f32) / ctx.pixels_per_point();
+        if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+            let limit = monitor * 0.9;
+            if size.x > limit.x || size.y > limit.y {
+                let shrink = (limit.x / size.x).min(limit.y / size.y);
+                size *= shrink;
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        true
     }
 
     // メニューアクションを実行する（右クリックメニューとキーボードショートカットの共通処理）
@@ -1244,6 +1341,7 @@ impl App {
             }
             MenuAction::ToggleFilterWindow => {
                 self.filter_window_open = !self.filter_window_open;
+                self.filter_focus_pending = self.filter_window_open;
             }
             MenuAction::ToggleResizeWindow => {
                 // 入力欄の初期化は show_resize_window で行う
@@ -1270,24 +1368,17 @@ impl App {
                 self.show_key("リロード");
             }
             MenuAction::ResizeWindow => {
-                if let Some((w, h)) = self.current_image_size {
-                    let (eff_w, eff_h) = if self.effective_transform().swaps_xy() {
-                        (h, w)
-                    } else {
-                        (w, h)
-                    };
-                    let mut size = egui::vec2(eff_w as f32, eff_h as f32);
-                    // 画像がモニタより大きいとウィンドウが画面外へはみ出すのでアスペクト比を保って収める
-                    if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
-                        let limit = monitor * 0.9;
-                        if size.x > limit.x || size.y > limit.y {
-                            let shrink = (limit.x / size.x).min(limit.y / size.y);
-                            size *= shrink;
-                        }
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                if self.fit_window_to_image(ctx) {
                     self.show_key("ウインドウをリサイズ");
                 }
+            }
+            MenuAction::SetViewMode(mode) => {
+                self.view_mode = mode;
+                self.pan = egui::Vec2::ZERO; // 等倍にしたときは中央から表示する
+                self.show_key(match mode {
+                    ViewMode::Actual => "等倍で表示",
+                    ViewMode::FitWindow => "ウインドウサイズで表示",
+                });
             }
             MenuAction::Quit => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1327,6 +1418,8 @@ impl App {
             .default_pos(ctx.screen_rect().right_top() + egui::vec2(-10.0, 10.0))
             .movable(true)
             .title_bar(false) // タイトルバーは出さず、入力欄だけのコンパクトな表示にする
+            // ドロップシャドウは付けない（枠線と背景はテーマのまま）
+            .frame(egui::Frame::window(&ctx.style()).shadow(egui::Shadow::NONE))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
@@ -1636,6 +1729,14 @@ impl App {
                 return;
             }
         }
+        // Ctrl+F はフィルターウインドウの表示/非表示。入力欄の編集中でもそのまま閉じられるよう、先に受け付ける
+        if self.resize_dialog.is_none() {
+            let ctrl_f = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::F));
+            if ctrl_f {
+                self.apply_menu_action(MenuAction::ToggleFilterWindow, ctx);
+                return;
+            }
+        }
         // ダイアログ表示中や、リサイズウインドウの入力欄を編集中は
         // 数字入力などがショートカットとして働かないようにする
         if self.resize_dialog.is_some() || ctx.wants_keyboard_input() {
@@ -1758,7 +1859,7 @@ impl App {
             // Ctrl+C も上の Copy イベント側で処理される（ここはフォールバック）
             if k.c           { self.apply_menu_action(MenuAction::CopyFile, ctx); }
             if k.o           { self.apply_menu_action(MenuAction::OpenFolder, ctx); }
-            if k.f           { self.apply_menu_action(MenuAction::ResizeWindow, ctx); }
+            if k.w           { self.apply_menu_action(MenuAction::ResizeWindow, ctx); }
             if k.r           { self.apply_menu_action(MenuAction::Reload, ctx); }
             if k.q           { self.apply_menu_action(MenuAction::Quit, ctx); }
             return; // Ctrlショートカットが処理されたら他のキー処理はスキップ
@@ -1918,9 +2019,48 @@ impl App {
         Some(drag_icon::render(thumbnail, &name, font, scale, action))
     }
 
+    // 等倍表示での画像中心のずれを返す。はみ出していれば中ボタンドラッグでスクロールさせる。
+    // `view` は画面に表示している向きでの画像の大きさ（論理 px）
+    fn actual_size_pan(&mut self, ui: &egui::Ui, area: egui::Rect, view: egui::Vec2) -> egui::Vec2 {
+        // 別の画像に移ったら中央から表示する
+        if self.pan_file != self.current_file {
+            self.pan_file = self.current_file.clone();
+            self.pan = egui::Vec2::ZERO;
+        }
+        let (middle_down, press_origin, delta) = ui.input(|i| {
+            (i.pointer.button_down(egui::PointerButton::Middle), i.pointer.press_origin(), i.pointer.delta())
+        });
+        let pressed_in_area = press_origin.is_some_and(|p| area.contains(p));
+        let overflow = (view - area.size()).max(egui::Vec2::ZERO);
+        // 他のウインドウ（フィルター・リサイズ）の上で押したときは動かさない
+        let on_image = press_origin
+            .and_then(|p| ui.ctx().layer_id_at(p))
+            .is_none_or(|l| l == ui.layer_id());
+        if middle_down && pressed_in_area && on_image && overflow != egui::Vec2::ZERO {
+            self.pan += delta; // 掴んだ画像がポインタについてくる向き
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        // 画像の端が表示領域の内側に入り込まないよう制限する（はみ出していない軸は中央）
+        let limit = overflow / 2.0;
+        self.pan = self.pan.clamp(-limit, limit);
+
+        // テクスチャがにじまないよう、画像の左上を物理ピクセルの境界に揃える
+        let ppp = ui.ctx().pixels_per_point();
+        let min = area.center() + self.pan - view / 2.0;
+        let snapped = egui::pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
+        self.pan + (snapped - min)
+    }
+
     // 画像を描画する
     fn draw_image(&mut self, ui: &mut egui::Ui) {
-        let Some(ref texture) = self.current_texture else {
+        // 表示する画像の読み込み中は、直前の画像を代わりに表示する
+        let loading = self.current_texture.is_none() && self.current_file.is_some();
+        let shown = match (&self.current_texture, &self.placeholder_texture) {
+            (Some(t), _) => Some(t.clone()),
+            (None, Some(t)) if loading => Some(t.clone()),
+            _ => None,
+        };
+        let Some(ref texture) = shown else {
             // テクスチャがない場合
             ui.centered_and_justified(|ui| {
                 if self.current_file.is_some() {
@@ -1961,8 +2101,13 @@ impl App {
         if eff_w <= 0.0 || eff_h <= 0.0 || available.x <= 0.0 || available.y <= 0.0 {
             return;
         }
-        // 利用可能な領域に収まるようにスケールを計算
-        let scale = (available.x / eff_w).min(available.y / eff_h);
+        let ppp = ui.ctx().pixels_per_point();
+        let scale = match self.view_mode {
+            // 利用可能な領域に収まるようにスケールを計算
+            ViewMode::FitWindow => (available.x / eff_w).min(available.y / eff_h),
+            // テクスチャの 1 px を画面の 1 物理ピクセルにする
+            ViewMode::Actual => 1.0 / ppp,
+        };
         // fit_to_exact_size には元の（回転前の）アスペクト比でサイズを渡す
         // 逆アスペクト比を渡すと egui 内部で二重縮小が起きて画像が小さくなる
         let display_size = egui::vec2(tex_size.x * scale, tex_size.y * scale);
@@ -1981,8 +2126,22 @@ impl App {
             .sense(egui::Sense::drag()); // ドラッグ可能にする
 
         // 画面中央に配置（回転の中心が画面中央になるようにする）
-        let centered_rect = egui::Rect::from_center_size(available_rect.center(), display_size);
+        let mut center = available_rect.center();
+        if self.view_mode == ViewMode::Actual {
+            center += self.actual_size_pan(ui, available_rect, egui::vec2(eff_w, eff_h) * scale);
+        }
+        let centered_rect = egui::Rect::from_center_size(center, display_size);
         let _response = ui.put(centered_rect, img);
+
+        if loading {
+            // 読み込み中であることを右上に示す。表示中の画像は別のファイルなので、ドラッグでは渡さない
+            let spinner_rect = egui::Rect::from_min_size(
+                available_rect.right_top() + egui::vec2(-40.0, 12.0),
+                egui::vec2(28.0, 28.0),
+            );
+            ui.put(spinner_rect, egui::Spinner::new().size(28.0));
+            return;
+        }
 
         // ドラッグ開始の検知：押下しただけでは起動せず、ポインタが閾値以上移動してから
         // プラットフォーム固有の DnD を起動する（GTK と同じ方式）。
@@ -1995,7 +2154,11 @@ impl App {
             if !ui.input(|i| i.pointer.any_down()) {
                 self.file_drag_triggered = false; // ボタンが離されたらジェスチャをリセット
             }
-            if _response.dragged() && !self.file_drag_triggered && self.current_file.is_some() {
+            // 中ボタンドラッグは等倍表示のスクロールに使うので、左ボタンのときだけ
+            if _response.dragged_by(egui::PointerButton::Primary)
+                && !self.file_drag_triggered
+                && self.current_file.is_some()
+            {
                 let moved_enough = ui.input(|i| {
                     i.pointer
                         .press_origin()
@@ -2070,16 +2233,25 @@ impl eframe::App for App {
 
             match result {
                 Ok((color_image, (w, h), thumbnail)) => {
+                    // 素早く送って先読みの範囲から外れた画像は、テクスチャにせずに捨てる
+                    // （大きな画像の転送はメインスレッドで時間がかかるため）
+                    let is_switch_target = self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path);
+                    if !self.cache_window.contains(&path)
+                        && self.current_file.as_ref() != Some(&path)
+                        && !is_switch_target
+                    {
+                        continue;
+                    }
                     let name = path.to_string_lossy(); // テクスチャ名はユニークにする
                     let texture = ctx.load_texture(name, color_image, TextureOptions::LINEAR);
 
                     // 現在表示すべきファイルなら、すぐに表示を更新
                     if self.current_file.as_ref() == Some(&path) {
                         self.current_texture = Some(texture.clone());
+                        self.placeholder_texture = None;
                         self.current_image_size = Some((w, h));
                     }
                     // キャッシュにテクスチャを保存
-                    let is_switch_target = self.switch_to_saved.as_ref().is_some_and(|sw| sw.dst == path);
                     // サムネイルはテクスチャと同じ時に入れ替えるので、表示中の画像とは常に一致する
                     self.thumbnail_cache.insert(path.clone(), std::sync::Arc::new(thumbnail));
                     self.texture_cache.insert(path, texture);
@@ -2095,6 +2267,7 @@ impl eframe::App for App {
                     }
                     // 現在のファイルでエラーが起きた場合のみメッセージを表示
                     if self.current_file.as_ref() == Some(&path) {
+                        self.placeholder_texture = None; // 直前の画像を出したままにしない
                         self.show_key(&format!("Error: {e}"));
                     }
                 }
@@ -2110,6 +2283,7 @@ impl eframe::App for App {
         if decoded_any {
             self.update_cache(ctx);
         }
+        self.fit_window_after_drop(ctx); // ドロップした画像の大きさにウインドウを合わせる
         self.poll_save_job(ctx); // 「リサイズして別名保存」の完了確認
         self.poll_dimensions(ctx); // 解像度フィルター用の解像度取得
 
@@ -2165,6 +2339,7 @@ impl eframe::App for App {
             let resize_window_open = self.resize_window.open;
             let filter_window_open = self.filter_window_open;
             let filter_active = self.current_filter().is_active();
+            let view_mode = self.view_mode;
 
             response.context_menu(|ui| {
                 // ラベルの右側にショートカットキーを添えたメニュー項目
@@ -2186,6 +2361,14 @@ impl eframe::App for App {
                     ui.close_menu();
                 }
 
+                // 表示方法（今の方法を選択中の見た目にする）
+                for (mode, label) in [(ViewMode::Actual, "等倍で表示"), (ViewMode::FitWindow, "ウインドウサイズで表示")] {
+                    if ui.add(egui::Button::new(label).selected(view_mode == mode)).clicked() {
+                        menu_action = Some(MenuAction::SetViewMode(mode));
+                        ui.close_menu();
+                    }
+                }
+
                 // ソート順切替
                 let sort_label = if sort_order == SortOrder::Natural { "更新日順にソート" } else { "自然順にソート" };
                 if item(ui, sort_label, "O") {
@@ -2199,7 +2382,7 @@ impl eframe::App for App {
                     (false, true) => "フィルターを表示（絞り込み中）",
                     (false, false) => "フィルターを表示",
                 };
-                if item(ui, filter_label, "") {
+                if item(ui, filter_label, "Ctrl+F") {
                     menu_action = Some(MenuAction::ToggleFilterWindow);
                     ui.close_menu();
                 }
@@ -2276,7 +2459,7 @@ impl eframe::App for App {
                         menu_action = Some(MenuAction::Reload);
                         ui.close_menu();
                     }
-                    if item(ui, "画像のサイズに合わせてウインドウをリサイズ", "Ctrl+F") {
+                    if item(ui, "画像のサイズに合わせてウインドウをリサイズ", "Ctrl+W") {
                         menu_action = Some(MenuAction::ResizeWindow);
                         ui.close_menu();
                     }
@@ -2428,6 +2611,31 @@ impl eframe::App for App {
 }
 
 // 同梱フォントの既定の配置場所（実行ファイルの隣、またはカレントディレクトリからの相対パス）
+/// 先読みする位置（表示中の画像からのずれ）を、読み込む順に返す。
+/// `direction` は直前に画像を送った向き（1: 次, -1: 前, 0: 不明）。
+/// 向きが分かっていれば前 CACHE_AHEAD 枚・後ろ CACHE_BEHIND 枚を、後ろ 1 枚につき前 2 枚の順で積む
+fn prefetch_offsets(direction: isize) -> Vec<isize> {
+    let (ahead, behind, ratio, sign) = match direction {
+        0 => (CACHE_SIZE, CACHE_SIZE, 1, 1),
+        d => (CACHE_AHEAD, CACHE_BEHIND, 2, d.signum()),
+    };
+    let mut offsets = vec![0];
+    let (mut a, mut b) = (1, 1);
+    while a <= ahead || b <= behind {
+        for _ in 0..ratio {
+            if a <= ahead {
+                offsets.push(a as isize * sign);
+                a += 1;
+            }
+        }
+        if b <= behind {
+            offsets.push(-(b as isize) * sign);
+            b += 1;
+        }
+    }
+    offsets
+}
+
 const BUNDLED_FONT_RELATIVE_PATH: &str =
     "assets/fonts/HackGen_NF_v2.10.0/HackGenConsoleNF-Regular.ttf";
 
@@ -4389,4 +4597,28 @@ fn collect_digits(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
         }
     }
     digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefetch_offsets_without_direction_alternates() {
+        let o = prefetch_offsets(0);
+        assert_eq!(&o[..5], &[0, 1, -1, 2, -2]);
+        assert_eq!(o.len(), CACHE_SIZE * 2 + 1);
+    }
+
+    #[test]
+    fn prefetch_offsets_favor_direction() {
+        let o = prefetch_offsets(1);
+        assert_eq!(&o[..7], &[0, 1, 2, -1, 3, 4, -2]);
+        assert_eq!(o.len(), CACHE_AHEAD + CACHE_BEHIND + 1);
+        assert_eq!(o.iter().filter(|&&d| d > 0).count(), CACHE_AHEAD);
+        assert_eq!(o.iter().filter(|&&d| d < 0).count(), CACHE_BEHIND);
+
+        let back = prefetch_offsets(-1);
+        assert_eq!(&back[..4], &[0, -1, -2, 1]);
+    }
 }
