@@ -179,7 +179,9 @@ struct App {
     cache_window: std::collections::HashSet<PathBuf>, // キャッシュ対象（表示中の画像と先読みの範囲）
     decode_limit: usize,                               // 同時に走らせるデコードの上限
     browse_direction: isize,                           // 直前に画像を送った向き（1: 次, -1: 前, 0: 不明）
-    placeholder_texture: Option<TextureHandle>,        // 表示する画像の読み込み中に、代わりに出しておく直前の画像
+    placeholder_texture: Option<TextureHandle>,        // 表示する画像の読み込み中に、代わりに出しておく画像
+    placeholder_follows: bool,                         // 別の画像へ移動中で、代わりの画像を近いものへ差し替えてよいか
+    failed_images: std::collections::HashSet<PathBuf>, // デコードに失敗した画像（内容が変わるまで再試行しない）
     texture_sender: std::sync::mpsc::Sender<DecodedImage>,
     texture_receiver: std::sync::mpsc::Receiver<DecodedImage>,
     cache_generation: u64,                    // 画像リスト／ファイル内容が変わるたびに増える
@@ -346,6 +348,8 @@ impl App {
                 .clamp(MIN_CONCURRENT_DECODES, MAX_CONCURRENT_DECODES),
             browse_direction: 0,
             placeholder_texture: None,
+            placeholder_follows: false,
+            failed_images: std::collections::HashSet::new(),
             texture_sender: tx,
             texture_receiver: rx,
             cache_generation: 0,
@@ -611,6 +615,7 @@ impl App {
         // 代わりに世代を進めて、走行中のデコード結果を受信時に破棄させる。
         self.texture_cache.clear();
         self.thumbnail_cache.clear();
+        self.failed_images.clear();
         self.cache_generation = self.cache_generation.wrapping_add(1);
 
         // 別のフォルダを開いたら、前のフォルダの解像度は不要なので捨てる
@@ -718,6 +723,7 @@ impl App {
         }
         for p in changed {
             self.texture_cache.remove(p);
+            self.failed_images.remove(p); // コピー途中で失敗した画像も、完了すれば読める
             self.dim_cache.remove(p); // 内容が変わったので解像度も取り直す
         }
 
@@ -768,6 +774,7 @@ impl App {
             return; // 画像リストが空なら何もしない
         }
         let path = self.images[self.current_index].clone();
+        let moved = self.current_file.as_ref() != Some(&path);
         self.current_file = Some(path.clone());
         // 回転角度はリセットせず、次の画像にも引き継ぐ。
         // 上書き保存した画像から離れたら、差し引き（applied_transform）は不要になる
@@ -782,17 +789,41 @@ impl App {
             // キャッシュされたテクスチャからサイズを取得
             let size = texture.size();
             self.current_image_size = Some((size[0] as u32, size[1] as u32));
+        } else if self.failed_images.contains(&path) {
+            // 読み込めない画像に、別の画像を重ねて見せない
+            self.current_texture = None;
+            self.placeholder_texture = None;
+            self.current_image_size = None;
         } else {
             // キャッシュにない場合は読み込み中にする。スピナーに置き換えるとちらつくので、
-            // 読み込めるまでは直前の画像を代わりに表示しておく（続けて送ったときは最初の画像のまま）
+            // 読み込めるまでは直前の画像を代わりに表示しておく。
+            // 別の画像へ移動したときは、現在位置に近いキャッシュ済みの画像があればそれを出す
             if let Some(prev) = self.current_texture.take() {
                 self.placeholder_texture = Some(prev);
             }
+            self.placeholder_follows = moved;
+            self.refresh_placeholder();
             self.current_image_size = None;
         }
 
         // 現在位置に基づいてキャッシュを更新し、必要な画像をプリフェッチする
         self.update_cache(ctx);
+    }
+
+    // 読み込み待ちの間に出す画像を、現在位置に最も近いキャッシュ済みの画像へ差し替える。
+    // 同じファイルの読み直しでは、別の画像に変わって見えないよう差し替えない
+    fn refresh_placeholder(&mut self) {
+        if !self.placeholder_follows || self.placeholder_texture.is_none() {
+            return;
+        }
+        let nearest = self
+            .prefetch_order()
+            .iter()
+            .skip(1) // 先頭は現在の画像（読み込み待ちなので対象外）
+            .find_map(|p| self.texture_cache.get(p).cloned());
+        if nearest.is_some() {
+            self.placeholder_texture = nearest;
+        }
     }
 
     // 画像を次に進めるか前に戻す
@@ -854,29 +885,35 @@ impl App {
         self.load_current_image(ctx);
     }
 
+    // 現在の画像と前後CACHE_SIZE枚をキャッシュ対象とする。
+    // 現在位置に近い順（0, +1, -1, +2, -2, ...）に並べることで、
+    // デコードの優先度が表示中の画像から順になるようにする。
+    // 画像を送る向きが分かっていれば、その向きを多めに（後ろ 1 枚につき前 2 枚の順で）積む。
+    fn prefetch_order(&self) -> Vec<PathBuf> {
+        let image_count = self.images.len() as isize;
+        let mut seen = std::collections::HashSet::new();
+        let mut order: Vec<PathBuf> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
+        for offset in prefetch_offsets(self.browse_direction) {
+            let index = (self.current_index as isize + offset).rem_euclid(image_count) as usize;
+            let path = &self.images[index];
+            // 画像枚数がキャッシュ幅より少ない場合は同じパスが重複するため、初回のみ積む
+            if seen.insert(path) {
+                order.push(path.clone());
+            }
+        }
+        order
+    }
+
     // キャッシュを更新し、必要な画像を非同期でプリフェッチする
     fn update_cache(&mut self, ctx: &egui::Context) {
         if self.images.is_empty() {
             return;
         }
 
-        let current_index = self.current_index;
-        let image_count = self.images.len() as isize;
-
-        // 1. 現在の画像と前後CACHE_SIZE枚をキャッシュ対象とする。
-        //    現在位置に近い順（0, +1, -1, +2, -2, ...）に並べることで、
-        //    デコードの優先度が表示中の画像から順になるようにする。
-        //    画像を送る向きが分かっていれば、その向きを多めに（後ろ 1 枚につき前 2 枚の順で）積む。
-        let mut retain_keys = std::collections::HashSet::new();
-        let mut prefetch_order: Vec<PathBuf> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
-        for offset in prefetch_offsets(self.browse_direction) {
-            let index = (current_index as isize + offset).rem_euclid(image_count) as usize;
-            let path = self.images[index].clone();
-            // 画像枚数がキャッシュ幅より少ない場合は同じパスが重複するため、初回のみ積む
-            if retain_keys.insert(path.clone()) {
-                prefetch_order.push(path);
-            }
-        }
+        // 1. キャッシュ対象を優先度順に求める
+        let prefetch_order = self.prefetch_order();
+        let retain_keys: std::collections::HashSet<PathBuf> =
+            prefetch_order.iter().cloned().collect();
 
         // 2. キャッシュ対象から外れたものをキャッシュから削除
         self.texture_cache.retain(|k, _| retain_keys.contains(k));
@@ -889,6 +926,7 @@ impl App {
         let current = &prefetch_order[0];
         if !self.texture_cache.contains_key(current)
             && !self.loading_images.contains(current)
+            && !self.failed_images.contains(current)
             && self.loading_images.len() < self.decode_limit * 2
         {
             self.spawn_decode(current.clone(), ctx);
@@ -901,7 +939,10 @@ impl App {
             if budget == 0 {
                 break;
             }
-            if self.texture_cache.contains_key(&path) || self.loading_images.contains(&path) {
+            if self.texture_cache.contains_key(&path)
+                || self.loading_images.contains(&path)
+                || self.failed_images.contains(&path)
+            {
                 continue;
             }
             budget -= 1;
@@ -1065,6 +1106,7 @@ impl App {
                 // 世代も進めて、保存前に走っていたデコード結果が後から
                 // 採用されて表示が巻き戻るのを防ぐ。
                 self.texture_cache.remove(&path);
+                self.failed_images.remove(&path);
                 self.cache_generation = self.cache_generation.wrapping_add(1);
                 self.current_texture = None;
                 self.current_image_size = None;
@@ -2063,7 +2105,10 @@ impl App {
         let Some(ref texture) = shown else {
             // テクスチャがない場合
             ui.centered_and_justified(|ui| {
-                if self.current_file.is_some() {
+                if self.current_file.as_ref().is_some_and(|f| self.failed_images.contains(f)) {
+                    // デコードに失敗した画像の場合（再試行しないのでスピナーは出さない）
+                    ui.label("この画像は読み込めません");
+                } else if self.current_file.is_some() {
                     // ファイルはあるが読み込み中の場合
                     ui.add(egui::Spinner::new());
                     ui.label("読み込み中...");
@@ -2270,6 +2315,8 @@ impl eframe::App for App {
                         self.placeholder_texture = None; // 直前の画像を出したままにしない
                         self.show_key(&format!("Error: {e}"));
                     }
+                    // 記録しないと update_cache が同じ画像を再投入し続け、デコード枠を占有する
+                    self.failed_images.insert(path);
                 }
             }
         }
@@ -2282,6 +2329,8 @@ impl eframe::App for App {
         }
         if decoded_any {
             self.update_cache(ctx);
+            // 届いた画像のうち現在位置に近いものへ差し替えて、待っている間も表示を進める
+            self.refresh_placeholder();
         }
         self.fit_window_after_drop(ctx); // ドロップした画像の大きさにウインドウを合わせる
         self.poll_save_job(ctx); // 「リサイズして別名保存」の完了確認
@@ -4571,6 +4620,7 @@ fn create_shm_file(size: usize) -> Option<std::fs::File> {
     None
 }
 
+#[cfg(target_os = "linux")]
 impl WlDispatch<wl_buffer::WlBuffer, ()> for WaylandDndState {
     fn event(
         _state: &mut Self,
@@ -4620,5 +4670,53 @@ mod tests {
 
         let back = prefetch_offsets(-1);
         assert_eq!(&back[..4], &[0, -1, -2, 1]);
+    }
+
+    fn test_app(names: &[&str]) -> App {
+        let mut app = App::new();
+        app.images = names.iter().map(|n| PathBuf::from(format!("rview-test-missing-{n}.png"))).collect();
+        app
+    }
+
+    fn test_texture(ctx: &egui::Context, name: &str) -> TextureHandle {
+        ctx.load_texture(name, ColorImage::example(), TextureOptions::LINEAR)
+    }
+
+    #[test]
+    fn failed_images_are_not_decoded_again() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&["a"]);
+        app.failed_images.insert(app.images[0].clone());
+        app.update_cache(&ctx);
+        assert!(app.loading_images.is_empty());
+    }
+
+    #[test]
+    fn moving_shows_the_nearest_cached_image_while_loading() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&["a", "b", "c", "d", "e"]);
+        app.current_file = Some(app.images[0].clone());
+        let prev = test_texture(&ctx, "a");
+        let near = test_texture(&ctx, "c");
+        app.current_texture = Some(prev.clone());
+        app.texture_cache.insert(app.images[0].clone(), prev);
+        app.texture_cache.insert(app.images[2].clone(), near.clone());
+
+        app.shift_image(true, &ctx); // b へ移動。進行方向の c が最も近い
+        assert!(app.current_texture.is_none());
+        assert_eq!(app.placeholder_texture.map(|t| t.id()), Some(near.id()));
+    }
+
+    #[test]
+    fn reloading_the_same_file_keeps_its_own_placeholder() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&["a", "b", "c"]);
+        app.current_file = Some(app.images[0].clone());
+        let own = test_texture(&ctx, "a");
+        app.current_texture = Some(own.clone());
+        app.texture_cache.insert(app.images[1].clone(), test_texture(&ctx, "b"));
+
+        app.load_current_image(&ctx);
+        assert_eq!(app.placeholder_texture.map(|t| t.id()), Some(own.id()));
     }
 }
