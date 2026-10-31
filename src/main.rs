@@ -4571,6 +4571,7 @@ fn create_shm_file(size: usize) -> Option<std::fs::File> {
     None
 }
 
+#[cfg(target_os = "linux")]
 impl WlDispatch<wl_buffer::WlBuffer, ()> for WaylandDndState {
     fn event(
         _state: &mut Self,
