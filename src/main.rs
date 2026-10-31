@@ -57,12 +57,17 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[  // サポートする画像ファイ�
 ];
 // 現在の画像の前後にキャッシュする枚数。
 // デコード済み画像は非圧縮 RGBA で保持されるため（4000x3000 で約 48MB/枚）、
-// 大きすぎるとメモリと VRAM を食い潰す。前後 8 枚 = 最大 17 枚を上限とする。
+// 大きすぎるとメモリと VRAM を食い潰す。どの配分でも合計 17 枚を上限とする。
+// 移動方向が未確定のときは前後 8 枚ずつ。
 const CACHE_SIZE: usize = 8;
-// 同時に走らせるデコードスレッドの上限。
+// 移動中は進行方向を厚く、背後を薄く持つ（連続スクロールで背後の画像は使われない）
+const CACHE_AHEAD: usize = 12;
+const CACHE_BEHIND: usize = 4;
+// 同時に走らせるデコードスレッド数の範囲（論理コア数に応じて決める）。
 // 一度に全キャッシュ対象を spawn するとメモリと CPU が飽和し、
 // 表示すべき画像のデコードが後回しになるため制限する。
-const MAX_CONCURRENT_DECODES: usize = 3;
+const MIN_CONCURRENT_DECODES: usize = 2;
+const MAX_CONCURRENT_DECODES: usize = 6;
 // ファイルドラッグ開始とみなすポインタ移動量 (ポイント)。ドラッグ送出は Linux / macOS のみ
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const DRAG_START_THRESHOLD: f32 = 6.0;
@@ -120,6 +125,9 @@ struct App {
     last_title: String,                       // 最後に送信したウィンドウタイトル（変化時のみ送るため）
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>, // テクスチャキャッシュ
     loading_images: std::collections::HashSet<PathBuf>, // 読み込み中の画像セット
+    failed_images: std::collections::HashSet<PathBuf>,  // デコードに失敗した画像（再試行しない）
+    nav_direction: isize,                     // 直近の移動方向（1: 次へ, -1: 前へ, 0: 未確定）
+    decode_limit: usize,                      // デコードの同時実行数
     texture_sender: std::sync::mpsc::Sender<DecodedImage>,
     texture_receiver: std::sync::mpsc::Receiver<DecodedImage>,
     cache_generation: u64,                    // 画像リスト／ファイル内容が変わるたびに増える
@@ -174,6 +182,12 @@ impl App {
             last_title: String::new(),
             texture_cache: std::collections::HashMap::new(),
             loading_images: std::collections::HashSet::new(),
+            failed_images: std::collections::HashSet::new(),
+            nav_direction: 0,
+            // UI スレッドの分を 1 コア残す
+            decode_limit: std::thread::available_parallelism()
+                .map_or(MIN_CONCURRENT_DECODES, |n| n.get().saturating_sub(1))
+                .clamp(MIN_CONCURRENT_DECODES, MAX_CONCURRENT_DECODES),
             texture_sender: tx,
             texture_receiver: rx,
             cache_generation: 0,
@@ -257,7 +271,12 @@ impl App {
         // クリアすると同時実行数の計算が狂い、同じ画像を二重にデコードしてしまう。
         // 代わりに世代を進めて、走行中のデコード結果を受信時に破棄させる。
         self.texture_cache.clear();
+        self.failed_images.clear();
         self.cache_generation = self.cache_generation.wrapping_add(1);
+        self.nav_direction = 0;
+        // 別の画像リストに切り替わるので、前の画像を暫定表示として残さない
+        self.current_texture = None;
+        self.current_image_size = None;
 
         self.list_up_images(dir); // 画像をリストアップ
         if self.images.is_empty() {
@@ -315,14 +334,57 @@ impl App {
             // キャッシュされたテクスチャからサイズを取得
             let size = texture.size();
             self.current_image_size = Some((size[0] as u32, size[1] as u32));
-        } else {
-            // キャッシュにない場合は、現在のテクスチャを一旦クリアして読み込み中を示す
+        } else if self.failed_images.contains(&path) {
+            // 読み込めない画像に別の画像を重ねて見せない
             self.current_texture = None;
             self.current_image_size = None;
+        } else {
+            // キャッシュにない場合は、デコード完了まで近くの画像（なければ直前の画像）を
+            // 暫定表示する。高速スクロール中は完了前に次へ進むため、ここで消すと
+            // 画面が空白のまま何も描画されなくなる。
+            // current_image_size は None にして「暫定表示中」の目印にする。
+            self.current_image_size = None;
+            self.refresh_provisional_texture();
         }
 
         // 現在位置に基づいてキャッシュを更新し、必要な画像をプリフェッチする
         self.update_cache(ctx);
+    }
+
+    // 暫定表示中なら、現在位置に最も近いキャッシュ済み画像へ表示を差し替える
+    fn refresh_provisional_texture(&mut self) {
+        let nearest = self
+            .prefetch_targets()
+            .iter()
+            .skip(1) // 先頭は現在の画像（未デコードなので対象外）
+            .find_map(|p| self.texture_cache.get(p).cloned());
+        if nearest.is_some() {
+            self.current_texture = nearest;
+        }
+    }
+
+    // 暫定表示（現在の画像のデコード待ちで別の画像を見せている状態）か
+    fn showing_provisional(&self) -> bool {
+        self.current_texture.is_some() && self.current_image_size.is_none()
+    }
+
+    // キャッシュ対象の画像を、デコードすべき順（先頭が現在の画像）で返す
+    fn prefetch_targets(&self) -> Vec<PathBuf> {
+        let mut targets: Vec<PathBuf> = Vec::with_capacity(CACHE_AHEAD + CACHE_BEHIND + 1);
+        if self.images.is_empty() {
+            return targets;
+        }
+        let image_count = self.images.len() as isize;
+        let mut seen = std::collections::HashSet::new();
+        for offset in prefetch_offsets(self.nav_direction) {
+            let index = (self.current_index as isize + offset).rem_euclid(image_count) as usize;
+            let path = &self.images[index];
+            // 画像枚数がキャッシュ幅より少ない場合は同じパスが重複するため、初回のみ積む
+            if seen.insert(path) {
+                targets.push(path.clone());
+            }
+        }
+        targets
     }
 
     // 画像を次に進めるか前に戻す
@@ -330,6 +392,7 @@ impl App {
         if self.images.is_empty() {
             return;
         }
+        self.nav_direction = if is_next { 1 } else { -1 };
         if is_next {
             // 次の画像へ (末尾の次は先頭)
             self.current_index = (self.current_index + 1) % self.images.len();
@@ -350,6 +413,7 @@ impl App {
             return;
         }
         self.current_index = 0;
+        self.nav_direction = 1; // 先頭からは後ろへ進むしかない
         self.load_current_image(ctx);
     }
 
@@ -359,6 +423,7 @@ impl App {
             return;
         }
         self.current_index = self.images.len() - 1;
+        self.nav_direction = -1; // 末尾からは前へ戻るしかない
         self.load_current_image(ctx);
     }
 
@@ -368,6 +433,7 @@ impl App {
             return;
         }
         self.current_index = self.current_index.saturating_sub(PAGE_JUMP_COUNT); // 0未満にならないように
+        self.nav_direction = -1;
         self.load_current_image(ctx);
     }
 
@@ -378,6 +444,7 @@ impl App {
         }
         self.current_index =
             (self.current_index + PAGE_JUMP_COUNT).min(self.images.len() - 1); // 配列の範囲を超えないように
+        self.nav_direction = 1;
         self.load_current_image(ctx);
     }
 
@@ -387,40 +454,36 @@ impl App {
             return;
         }
 
-        let current_index = self.current_index;
-        let image_count = self.images.len() as isize;
-
-        // 1. 現在の画像と前後CACHE_SIZE枚をキャッシュ対象とする。
-        //    現在位置に近い順（0, +1, -1, +2, -2, ...）に並べることで、
-        //    デコードの優先度が表示中の画像から順になるようにする。
-        let mut retain_keys = std::collections::HashSet::new();
-        let mut prefetch_order: Vec<PathBuf> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
-        let mut offsets: Vec<isize> = Vec::with_capacity(CACHE_SIZE * 2 + 1);
-        offsets.push(0);
-        for d in 1..=CACHE_SIZE as isize {
-            offsets.push(d);
-            offsets.push(-d);
-        }
-        for offset in offsets {
-            let index = (current_index as isize + offset).rem_euclid(image_count) as usize;
-            let path = self.images[index].clone();
-            // 画像枚数がキャッシュ幅より少ない場合は同じパスが重複するため、初回のみ積む
-            if retain_keys.insert(path.clone()) {
-                prefetch_order.push(path);
-            }
-        }
+        // 1. キャッシュ対象を優先度順に求める
+        let prefetch_order = self.prefetch_targets();
+        let retain_keys: std::collections::HashSet<PathBuf> =
+            prefetch_order.iter().cloned().collect();
 
         // 2. キャッシュ対象から外れたものをキャッシュから削除
         self.texture_cache.retain(|k, _| retain_keys.contains(k));
 
         // 3. 新しくキャッシュ対象になった画像を、同時実行数を制限しつつ読み込む。
         //    上限に達した分は、デコード完了時に update() から再度呼ばれて続きが走る。
-        let mut budget = MAX_CONCURRENT_DECODES.saturating_sub(self.loading_images.len());
+        //    走行中のデコードは中断できないので、スクロールで対象外になった分は
+        //    枠に数えない（古いデコードの完了待ちで表示すべき画像が止まらないように）。
+        //    ただしスレッドが増え続けないよう、全体で上限の 2 倍までに抑える。
+        let active = self
+            .loading_images
+            .iter()
+            .filter(|p| retain_keys.contains(*p))
+            .count();
+        let mut budget = self
+            .decode_limit
+            .saturating_sub(active)
+            .min((self.decode_limit * 2).saturating_sub(self.loading_images.len()));
         for path in prefetch_order {
             if budget == 0 {
                 break;
             }
-            if self.texture_cache.contains_key(&path) || self.loading_images.contains(&path) {
+            if self.texture_cache.contains_key(&path)
+                || self.loading_images.contains(&path)
+                || self.failed_images.contains(&path)
+            {
                 continue;
             }
             budget -= 1;
@@ -547,10 +610,12 @@ impl App {
                 // 世代も進めて、保存前に走っていたデコード結果が後から
                 // 採用されて表示が巻き戻るのを防ぐ。
                 self.texture_cache.remove(&path);
+                self.failed_images.clear();
                 self.cache_generation = self.cache_generation.wrapping_add(1);
-                self.current_texture = None;
                 self.current_image_size = None;
                 self.load_current_image(ctx);
+                // 保存直後に隣の画像が暫定表示されないよう、自身のデコード完了まで空にする
+                self.current_texture = None;
                 self.show_key("上書き保存しました");
             }
             Ok(()) => {
@@ -1046,7 +1111,10 @@ impl App {
         let Some(ref texture) = self.current_texture else {
             // テクスチャがない場合
             ui.centered_and_justified(|ui| {
-                if self.current_file.is_some() {
+                if self.current_file.as_ref().is_some_and(|f| self.failed_images.contains(f)) {
+                    // デコードに失敗した画像の場合（再試行しないのでスピナーは出さない）
+                    ui.label("この画像は読み込めません");
+                } else if self.current_file.is_some() {
                     // ファイルはあるが読み込み中の場合
                     ui.add(egui::Spinner::new());
                     ui.label("読み込み中...");
@@ -1179,6 +1247,11 @@ impl eframe::App for App {
 
             match result {
                 Ok((color_image, (w, h))) => {
+                    // スクロールで既に対象外になった画像は、VRAM へ転送せずに捨てる。
+                    // 転送は UI スレッドの負担になり、どうせ直後に追い出される
+                    if !self.prefetch_targets().contains(&path) {
+                        continue;
+                    }
                     let name = path.to_string_lossy(); // テクスチャ名はユニークにする
                     let texture = ctx.load_texture(name, color_image, TextureOptions::LINEAR);
 
@@ -1194,7 +1267,11 @@ impl eframe::App for App {
                     // 現在のファイルでエラーが起きた場合のみメッセージを表示
                     if self.current_file.as_ref() == Some(&path) {
                         self.show_key(&format!("Error: {e}"));
+                        self.current_texture = None; // 暫定表示を残さない
+                        self.current_image_size = None;
                     }
+                    // 記録しないと update_cache が同じ画像を再投入し続け、デコード枠を占有する
+                    self.failed_images.insert(path);
                 }
             }
         }
@@ -1202,7 +1279,12 @@ impl eframe::App for App {
         // 同時に、別ディレクトリを開いた後に到着した古い結果をキャッシュから追い出す。
         if decoded_any {
             self.update_cache(ctx);
+            // 暫定表示中なら、届いた画像のうち現在位置に近いものへ差し替えて表示を進める
+            if self.showing_provisional() {
+                self.refresh_provisional_texture();
+            }
         }
+
 
         // スライドショーの更新
         if self.is_sliding {
@@ -1437,6 +1519,16 @@ impl eframe::App for App {
                         );
                     });
             }
+        }
+
+        // 暫定表示中のインジケーター（右上）。
+        // ファイル名は既に次の画像を指しているので、まだ別の画像が見えていることを示す
+        if self.showing_provisional() {
+            egui::Area::new(egui::Id::new("loading_overlay"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                .show(ctx, |ui| {
+                    ui.add(egui::Spinner::new().color(egui::Color32::WHITE));
+                });
         }
 
         // キー操作のオーバーレイ（右下）
@@ -3228,4 +3320,47 @@ fn collect_digits(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
         }
     }
     digits
+}
+
+// 現在位置からのオフセットを、デコードすべき順に返す（先頭は常に 0）。
+// direction が 0 なら前後均等、それ以外は進行方向を背後より優先して厚く取る。
+fn prefetch_offsets(direction: isize) -> Vec<isize> {
+    let (ahead, behind, sign) = match direction {
+        0 => (CACHE_SIZE, CACHE_SIZE, 1),
+        d => (CACHE_AHEAD, CACHE_BEHIND, d.signum()),
+    };
+    // 背後は枚数比のぶん遅らせる（前方 3 枚につき背後 1 枚の割合で混ぜる）
+    let behind_weight = ahead / behind;
+    let mut keyed: Vec<(usize, isize)> = (1..=ahead)
+        .map(|d| (d, sign * d as isize))
+        .chain((1..=behind).map(|d| (d * behind_weight, -sign * d as isize)))
+        .collect();
+    keyed.sort_by_key(|&(key, _)| key); // 安定ソートなので同順位は前方が先
+    std::iter::once(0).chain(keyed.into_iter().map(|(_, offset)| offset)).collect()
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_direction_is_symmetric() {
+        let offsets = prefetch_offsets(0);
+        assert_eq!(&offsets[..5], &[0, 1, -1, 2, -2]);
+        assert_eq!(offsets.len(), CACHE_SIZE * 2 + 1);
+    }
+
+    #[test]
+    fn moving_prioritizes_the_direction_of_travel() {
+        assert_eq!(&prefetch_offsets(1)[..6], &[0, 1, 2, 3, -1, 4]);
+        assert_eq!(&prefetch_offsets(-1)[..6], &[0, -1, -2, -3, 1, -4]);
+    }
+
+    // 方向によってキャッシュの最大枚数（メモリ使用量）が増えないこと
+    #[test]
+    fn window_size_does_not_depend_on_direction() {
+        for direction in [-1, 0, 1] {
+            assert_eq!(prefetch_offsets(direction).len(), CACHE_SIZE * 2 + 1);
+        }
+    }
 }
