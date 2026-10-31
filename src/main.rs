@@ -161,7 +161,6 @@ struct App {
     save_job: Option<SaveJob>,                // バックグラウンドで実行中の「リサイズして別名保存」
     save_queue: std::collections::VecDeque<SaveRequest>, // 実行待ちの「リサイズして別名保存」（受け付け順に 1 件ずつ実行）
     switch_to_saved: Option<SavedSwitch>,     // 保存完了後、読み込みを待って表示を切り替える先
-    fit_window_pending: Option<PathBuf>,      // ドロップ後、読み込みを待ってウインドウを合わせる画像
     // 自分で書き込んだファイルと、そのときの更新日時。フォルダ監視の変更通知のうち、
     // 内容が書き込んだときのままのものはキャッシュを捨てない（切り替え直後に「読み込み中」が挟まるのを防ぐ）
     self_written: std::collections::HashMap<PathBuf, std::time::SystemTime>,
@@ -330,7 +329,6 @@ impl App {
             save_job: None,
             save_queue: std::collections::VecDeque::new(),
             switch_to_saved: None,
-            fit_window_pending: None,
             self_written: std::collections::HashMap::new(),
             key_overlay_text: String::new(),
             key_overlay_hide_at: None,
@@ -1268,34 +1266,9 @@ impl App {
             self.init_images(&dir, Some(path), ctx);
             // ドロップ時はスライドショーを自動開始しない（表示するだけ）
         }
-        // 最初に表示する画像の読み込みを待って、ウインドウをその大きさに合わせる
-        self.fit_window_pending = self.current_file.clone();
-    }
-
-    // ドロップした画像が読み込めたら、ウインドウをその大きさに合わせる（1 回だけ）
-    fn fit_window_after_drop(&mut self, ctx: &egui::Context) {
-        let Some(ref pending) = self.fit_window_pending else { return };
-        // 読み込み前に別の画像へ移ったら、合わせるのはやめる
-        if self.current_file.as_ref() != Some(pending) {
-            self.fit_window_pending = None;
-            return;
-        }
-        if self.current_image_size.is_none() {
-            return; // まだ読み込み中
-        }
-        self.fit_window_pending = None;
-        // 全画面表示はそのままにする。最大化中は大きさを変えられないので解除してから合わせる
-        let (fullscreen, maximized) = ctx.input(|i| {
-            let v = i.viewport();
-            (v.fullscreen.unwrap_or(false), v.maximized.unwrap_or(false))
-        });
-        if fullscreen {
-            return;
-        }
-        if maximized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-        }
-        self.fit_window_to_image(ctx);
+        // ドロップした画像はウインドウサイズに合わせて表示する（等倍表示中でも戻す）
+        self.view_mode = ViewMode::FitWindow;
+        self.pan = egui::Vec2::ZERO;
     }
 
     // ウインドウの大きさを表示中の画像（回転・反転後の向き）に合わせる。
@@ -2332,7 +2305,6 @@ impl eframe::App for App {
             // 届いた画像のうち現在位置に近いものへ差し替えて、待っている間も表示を進める
             self.refresh_placeholder();
         }
-        self.fit_window_after_drop(ctx); // ドロップした画像の大きさにウインドウを合わせる
         self.poll_save_job(ctx); // 「リサイズして別名保存」の完了確認
         self.poll_dimensions(ctx); // 解像度フィルター用の解像度取得
 
@@ -2410,9 +2382,10 @@ impl eframe::App for App {
                     ui.close_menu();
                 }
 
-                // 表示方法（今の方法を選択中の見た目にする）
+                // 表示方法（今の方法には、ショートカットの欄に ✔ を出す。
+                // 選択中の背景色はマウスを合わせたときと見分けにくいので使わない）
                 for (mode, label) in [(ViewMode::Actual, "等倍で表示"), (ViewMode::FitWindow, "ウインドウサイズで表示")] {
-                    if ui.add(egui::Button::new(label).selected(view_mode == mode)).clicked() {
+                    if item(ui, label, if view_mode == mode { "✔" } else { "" }) {
                         menu_action = Some(MenuAction::SetViewMode(mode));
                         ui.close_menu();
                     }
