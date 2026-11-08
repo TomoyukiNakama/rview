@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=rviewer
+Comment=画像ビューワー
+Exec=@BIN@ %f
+Icon=@ICON@
+Terminal=false
+# ウインドウの app_id（src/main.rs の with_app_id）と合わせる。
+# ずれていると GNOME などがウインドウとこのエントリを結び付けられず、タスクバーのアイコンが出ない
+StartupWMClass=rview
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/bmp;image/gif;image/tiff;image/webp;

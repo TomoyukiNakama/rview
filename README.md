@@ -22,6 +22,26 @@ cargo build --release
 
 Linux では X11 / Wayland の両方で動作する。
 
+## インストール（Linux）
+
+ユーザー単位でインストールする（root 権限は不要）。再実行すると最新のソースで更新される。
+
+```bash
+packaging/linux/install.sh
+```
+
+| インストール先 | 内容 |
+|---|---|
+| `~/.local/bin/rviewer` | 実行ファイル |
+| `~/.local/share/icons/rviewer.png` | アイコン |
+| `~/.local/share/applications/rviewer.desktop` | デスクトップエントリ（アプリ一覧からの起動、画像の「別のアプリで開く」） |
+
+アンインストールは `packaging/linux/install.sh --uninstall`。
+
+デスクトップエントリの雛形は `packaging/linux/rviewer.desktop`。
+`StartupWMClass` はウインドウの app_id（`src/main.rs` の `with_app_id`）と一致させておく必要があり、
+ずれていると GNOME などでタスクバーにアイコンが表示されない。
+
 ## 実行
 
 ```bash
