@@ -10,7 +10,7 @@ keywords = ["image-viewer", "egui", "gui"]
 categories = ["multimedia::images"]
 
 [[bin]]
-name = "rview"
+name = "rviewer"
 path = "src/main.rs"
 
 [dependencies]

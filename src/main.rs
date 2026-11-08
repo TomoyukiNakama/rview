@@ -2666,7 +2666,7 @@ const BUNDLED_FONT_RELATIVE_PATH: &str =
 const JAPANESE_PROBE_CHARS: [char; 2] = ['あ', '漢'];
 
 // 実行ファイルのあるディレクトリから何階層上まで assets/ を探すか
-// （target/release/rview から見てリポジトリルートに届くようにする）
+// （target/release/rviewer から見てリポジトリルートに届くようにする）
 const EXE_ANCESTOR_SEARCH_DEPTH: usize = 4;
 
 // ファイル名にこれらが含まれるフォントを日本語フォント候補として優先する

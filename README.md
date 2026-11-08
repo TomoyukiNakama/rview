@@ -17,7 +17,7 @@ WPF 製の Windows 専用ビューワー `view` を移植したもの。
 
 ```bash
 cargo build --release
-# 出力: target/release/rview
+# 出力: target/release/rviewer
 ```
 
 Linux では X11 / Wayland の両方で動作する。
@@ -25,9 +25,9 @@ Linux では X11 / Wayland の両方で動作する。
 ## 実行
 
 ```bash
-rview                    # カレントディレクトリの画像を開く
-rview path/to/image.jpg  # 指定した画像を開く
-rview path/to/dir        # 指定したディレクトリの画像を開く
+rviewer                    # カレントディレクトリの画像を開く
+rviewer path/to/image.jpg  # 指定した画像を開く
+rviewer path/to/dir        # 指定したディレクトリの画像を開く
 ```
 
 ## 日本語表示用フォントの設定
@@ -39,9 +39,9 @@ rview path/to/dir        # 指定したディレクトリの画像を開く
 1. 環境変数 `RVIEW_FONT` による明示指定
 
    ```bash
-   RVIEW_FONT=/path/to/font.ttf rview
+   RVIEW_FONT=/path/to/font.ttf rviewer
    # .ttc（フォントコレクション）はフェイス番号を付けて指定できる
-   RVIEW_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0 rview
+   RVIEW_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0 rviewer
    ```
 
 2. 同梱フォント（実行ファイルのあるディレクトリとその上位、またはカレントディレクトリからの相対パス）

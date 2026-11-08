@@ -10,7 +10,7 @@ WPF 製 `view` を Rust + egui で移植した画像ビューワーの仕様。
 ドラッグ＆ドロップで画像ファイル/フォルダを開き、キーボード・マウスホイールで操作できる。
 
 - **ターゲット**: Linux / Windows / macOS
-- **実行バイナリ**: `rview`（コンソールウィンドウなし）
+- **実行バイナリ**: `rviewer`（コンソールウィンドウなし）
 
 ---
 
@@ -451,7 +451,7 @@ cargo build
 
 # リリースビルド
 cargo build --release
-# 出力: target/release/rview
+# 出力: target/release/rviewer
 
 # 実行
 cargo run
