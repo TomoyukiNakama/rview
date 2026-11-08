@@ -60,6 +60,7 @@ enum MenuAction {
 // 定数定義
 const SLIDE_SHOW_INTERVAL_MS: u64 = 3000; // スライドショーの画像切り替え間隔 (ミリ秒)
 const KEY_OVERLAY_SHOW_MS: u64 = 1000;    // キー操作のオーバーレイ表示時間 (ミリ秒)
+const SAVE_NOTICE_SHOW_MS: u64 = 3000;    // 保存結果のポップアップ表示時間 (ミリ秒)
 const PAGE_JUMP_COUNT: usize = 10;        // PageUp/PageDownでの移動枚数
 const SCROLL_DEBOUNCE_MS: u64 = 50;     // スクロールによる画像切り替えのデバウンス間隔 (ミリ秒)
 const SCROLL_THRESHOLD: f32 = 10.0;        // スクロール検出の閾値 (ポイント)
@@ -149,10 +150,11 @@ struct App {
     rotation_angle: f32,                      // 画像の回転角度 (度)
     flip_h: bool,                             // 左右反転（画面上で回転の後に適用）
     flip_v: bool,                             // 上下反転（画面上で回転の後に適用）
-    // 上書き保存でファイルに焼き込んだ変換と、そのファイル。
+    // 保存（上書き・新規）でファイルに焼き込んだ表示上の回転・反転を、ファイルごとに記録する。
     // 回転・反転の状態は保存後も次の画像へ引き継ぐが、保存した画像自体は既に変換済みなので、
-    // 表示中はこの分を差し引いて二重に回転しないようにする
-    applied_transform: Option<(PathBuf, rotate_save::Transform)>,
+    // 表示するときはこの分を差し引いて二重に回転しないようにする。
+    // 一度離れてから戻ってきても差し引けるよう、他から変更・削除されるまで保持する
+    applied_transforms: std::collections::HashMap<PathBuf, rotate_save::Transform>,
     // 保存時に適用する画像サイズと、その対象ファイル。サイズは回転・反転前の元画像の向きでの (幅, 高さ)。
     // 画像ごとに大きさが違うので、回転・反転と違って他の画像には引き継がない
     pending_resize: Option<(PathBuf, (u32, u32))>,
@@ -166,6 +168,7 @@ struct App {
     self_written: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     key_overlay_text: String,                 // オーバーレイ表示するテキスト
     key_overlay_hide_at: Option<Instant>,     // オーバーレイを非表示にする時刻
+    save_notice: Option<(String, Instant)>,   // 保存結果のポップアップ（本文, 非表示にする時刻）
     last_scroll_shift: Option<Instant>,        // スクロールデバウンス用タイムスタンプ
     last_scroll_input: Option<Instant>,        // 最後にホイール入力があった時刻（蓄積リセット判定用）
     scroll_accumulator: f32,                  // マウスホイールのスクロール量の蓄積
@@ -263,6 +266,7 @@ struct SaveRequest {
     transform: rotate_save::Transform, // ファイルに施す変換
     resize: Option<(u32, u32)>,        // 元画像の向きでの (幅, 高さ)
     applied: rotate_save::Transform,   // 保存したファイルに焼き込んだ表示上の回転・反転
+    summary: String,                   // 保存の通知に出す、施す変換の説明
 }
 
 /// バックグラウンドで実行中の「リサイズして別名保存」。
@@ -277,7 +281,6 @@ struct SaveJob {
 struct SavedSwitch {
     src: PathBuf, // この画像を表示したままのときだけ切り替える
     dst: PathBuf,
-    applied: rotate_save::Transform,
 }
 
 /// バックグラウンドスレッドから返るデコード結果。
@@ -322,7 +325,7 @@ impl App {
             rotation_angle: 0.0,
             flip_h: false,
             flip_v: false,
-            applied_transform: None,
+            applied_transforms: std::collections::HashMap::new(),
             pending_resize: None,
             resize_dialog: None,
             resize_window: ResizeWindow::default(),
@@ -332,6 +335,7 @@ impl App {
             self_written: std::collections::HashMap::new(),
             key_overlay_text: String::new(),
             key_overlay_hide_at: None,
+            save_notice: None,
             last_scroll_shift: None,
             last_scroll_input: None,
             scroll_accumulator: 0.0,
@@ -708,6 +712,10 @@ impl App {
             let mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
             mtime != Some(written) // 書き込んだ後に他から変更されていれば捨てる
         });
+        // 他から変更・削除されたファイルは、焼き込んだ回転・反転の記録が当てにならなくなる
+        for p in &changed {
+            self.applied_transforms.remove(p);
+        }
         self.refresh_image_list(&changed, ctx);
     }
 
@@ -774,11 +782,7 @@ impl App {
         let path = self.images[self.current_index].clone();
         let moved = self.current_file.as_ref() != Some(&path);
         self.current_file = Some(path.clone());
-        // 回転角度はリセットせず、次の画像にも引き継ぐ。
-        // 上書き保存した画像から離れたら、差し引き（applied_transform）は不要になる
-        if self.applied_transform.as_ref().is_some_and(|(p, _)| *p != path) {
-            self.applied_transform = None;
-        }
+        // 回転角度はリセットせず、次の画像にも引き継ぐ
 
         // まずキャッシュからテクスチャを探す
         if let Some(texture) = self.texture_cache.get(&path) {
@@ -1010,18 +1014,31 @@ impl App {
         rotate_save::Transform::from_view(r, self.flip_h, self.flip_v)
     }
 
-    // 上書き保存済みの画像を表示中か
+    // 表示中の画像に保存で焼き込んだ回転・反転（保存したことがなければ None）
+    fn current_applied(&self) -> Option<rotate_save::Transform> {
+        self.current_file.as_ref().and_then(|p| self.applied_transforms.get(p)).copied()
+    }
+
+    // 回転・反転を焼き込んで保存した画像を表示中か
     fn showing_applied(&self) -> bool {
-        matches!((&self.applied_transform, &self.current_file), (Some((p, _)), Some(cur)) if p == cur)
+        self.current_applied().is_some()
     }
 
     // 描画と保存で共通に使う、今の画像に施す変換。
-    // 上書き保存済みの画像なら、ファイルに焼き込んだ分を差し引く
+    // 保存済みの画像なら、ファイルに焼き込んだ分を差し引く
     fn effective_transform(&self) -> rotate_save::Transform {
         let view = self.view_transform();
-        match &self.applied_transform {
-            Some((_, applied)) if self.showing_applied() => applied.inverse().then(view),
-            _ => view,
+        match self.current_applied() {
+            Some(applied) => applied.inverse().then(view),
+            None => view,
+        }
+    }
+
+    // 自分で書き込んだファイルを記録する。フォルダ監視の変更通知で
+    // キャッシュや焼き込んだ回転・反転の記録を捨てないようにするため
+    fn record_self_written(&mut self, path: &Path) {
+        if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+            self.self_written.insert(path.to_path_buf(), mtime);
         }
     }
 
@@ -1035,16 +1052,24 @@ impl App {
 
     // 回転・反転と、サイズ変更 `resize`（元画像の向きでの (幅, 高さ)）の状態を
     // (左上に表示するラベル, 新規保存のファイル名に付ける文字列) の列で返す。何もしていなければ空
-    fn transform_labels(&self, resize: Option<(u32, u32)>) -> Vec<(String, String)> {
-        let r = (self.rotation_angle as i32).rem_euclid(360);
+    // `for_file` が true なら、表示の状態ではなく実際にファイルへ施す変換を表す
+    // （保存済みの画像では焼き込んだ分を差し引いた変換を、画面上の見た目（回転してから左右反転）に直す）
+    fn transform_labels(&self, resize: Option<(u32, u32)>, for_file: bool) -> Vec<(String, String)> {
+        let (r, flip_h, flip_v) = if for_file && self.showing_applied() {
+            let t = self.effective_transform();
+            let r = if t.mirror { (360 - t.angle) % 360 } else { t.angle };
+            (r as i32, t.mirror, false)
+        } else {
+            ((self.rotation_angle as i32).rem_euclid(360), self.flip_h, self.flip_v)
+        };
         let mut labels = Vec::new();
         if r != 0 {
             labels.push((format!("回転: {r}°"), format!("rot{r}")));
         }
-        if self.flip_h {
+        if flip_h {
             labels.push(("左右反転".to_string(), "fliph".to_string()));
         }
-        if self.flip_v {
+        if flip_v {
             labels.push(("上下反転".to_string(), "flipv".to_string()));
         }
         if let Some((w, h)) = resize {
@@ -1065,11 +1090,26 @@ impl App {
     // 新規保存の保存先。例: 元名_rot90_fliph_800x600.png
     // 実行中・実行待ちの保存先とも重ならない名前にする（同じ画像を続けて保存しても上書きし合わないように）
     fn new_save_path(&self, path: &Path, resize: Option<(u32, u32)>) -> PathBuf {
-        let parts: Vec<String> = self.transform_labels(resize).into_iter().map(|(_, s)| s).collect();
+        let parts: Vec<String> = self.transform_labels(resize, true).into_iter().map(|(_, s)| s).collect();
         let reserved = |p: &Path| {
             self.save_job.iter().map(|j| &j.request).chain(&self.save_queue).any(|r| r.dst == p)
         };
         rotate_save::unique_path_excluding(path, &parts.join("_"), reserved)
+    }
+
+    // 保存の通知に出す、ファイルに施す変換の説明。例: 回転: 90° / 左右反転 / サイズ: 800x600
+    fn save_summary(&self, resize: Option<(u32, u32)>) -> String {
+        let labels: Vec<String> = self.transform_labels(resize, true).into_iter().map(|(l, _)| l).collect();
+        if labels.is_empty() {
+            "回転・反転・サイズ変更なし".to_string()
+        } else {
+            labels.join(" / ")
+        }
+    }
+
+    // 保存結果を画面上部にポップアップで表示する
+    fn show_save_notice(&mut self, text: &str) {
+        self.save_notice = Some((text.to_string(), Instant::now() + Duration::from_millis(SAVE_NOTICE_SHOW_MS)));
     }
 
     // 回転・反転と、サイズ変更 `resize`（元画像の向きでの (幅, 高さ)）を施して保存する
@@ -1092,11 +1132,16 @@ impl App {
         } else {
             self.new_save_path(&path, resize)
         };
-        match rotate_save::save_transformed(&path, &dst, transform, resize) {
+        let summary = self.save_summary(resize);
+        let result = rotate_save::save_transformed(&path, &dst, transform, resize);
+        if result.is_ok() {
+            // 回転・反転の状態はリセットせず次の画像へ引き継ぐ。
+            // 保存したファイルはもう変換済みなので、表示するときは焼き込んだ分を差し引く
+            self.applied_transforms.insert(dst.clone(), self.view_transform());
+            self.record_self_written(&dst);
+        }
+        match result {
             Ok(()) if overwrite => {
-                // 回転・反転の状態はリセットせず次の画像へ引き継ぐ。
-                // この画像はもう変換済みなので、表示中は焼き込んだ分を差し引く
-                self.applied_transform = Some((path.clone(), self.view_transform()));
                 // サイズ変更もファイルに焼き込んだので解除する
                 self.pending_resize = None;
                 // ファイルの中身が変わったので、キャッシュ済みテクスチャを捨てて
@@ -1109,14 +1154,15 @@ impl App {
                 self.current_texture = None;
                 self.current_image_size = None;
                 self.load_current_image(ctx);
-                self.show_key("上書き保存しました");
+                let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                self.show_save_notice(&format!("上書き保存しました\n{name}\n{summary}"));
             }
             Ok(()) => {
                 // 新しいファイルを一覧に加える。表示は元画像のまま（元ファイルは未変換なので回転・反転も保つ）
                 let dir = self.current_dir.clone();
                 self.init_images(&dir, Some(&path), ctx);
                 let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                self.show_key(&format!("新規保存: {name}"));
+                self.show_save_notice(&format!("新規保存しました\n{name}\n{summary}"));
             }
             Err(e) => self.show_key(&format!("保存エラー: {e}")),
         }
@@ -1144,9 +1190,7 @@ impl App {
         if self.pending_resize.as_ref().is_some_and(|(p, _)| *p == path) {
             self.pending_resize = None;
         }
-        if self.applied_transform.as_ref().is_some_and(|(p, _)| *p == path) {
-            self.applied_transform = None;
-        }
+        self.applied_transforms.remove(&path);
         if self.images.is_empty() {
             self.slide_show(false);
             self.current_texture = None;
@@ -1533,6 +1577,7 @@ impl App {
             transform: self.effective_transform(),
             resize,
             applied: self.view_transform(),
+            summary: self.save_summary(resize),
         });
         self.start_next_save(ctx);
         self.show_saving_status();
@@ -1598,20 +1643,20 @@ impl App {
             return;
         }
         // 自分で書いたファイルの変更通知で、読み込んだばかりのキャッシュを捨てないよう記録しておく
-        if let Ok(mtime) = std::fs::metadata(&job.dst).and_then(|m| m.modified()) {
-            self.self_written.insert(job.dst.clone(), mtime);
-        }
+        self.record_self_written(&job.dst);
+        // 保存したファイルは回転・反転済みなので、表示するときは焼き込んだ分を差し引く。
+        // 保存中に別の画像へ移っていても、後でこのファイルを開いたときに二重に回転しないよう記録する
+        self.applied_transforms.insert(job.dst.clone(), job.applied);
         // 解像度フィルター中でも、保存したファイルがすぐ一覧に入るよう解像度を先に調べておく
         self.dim_cache.insert(job.dst.clone(), image::image_dimensions(&job.dst).ok());
         // キャッシュを保ったまま一覧を取り直すので、元の画像の表示は途切れない
         self.refresh_image_list(&std::collections::HashSet::new(), ctx);
         let name = job.dst.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        self.show_save_notice(&format!("新規保存しました\n{name}\n{}", job.summary));
         if self.current_file.as_ref() != Some(&job.src) || !self.images.contains(&job.dst) {
-            // 保存中に別の画像へ移っていたら切り替えない
-            self.show_key(&format!("新規保存: {name}"));
-            return;
+            return; // 保存中に別の画像へ移っていたら切り替えない
         }
-        self.switch_to_saved = Some(SavedSwitch { src: job.src, dst: job.dst.clone(), applied: job.applied });
+        self.switch_to_saved = Some(SavedSwitch { src: job.src, dst: job.dst.clone() });
         if self.texture_cache.contains_key(&job.dst) {
             self.finish_switch_to_saved(ctx);
         } else if !self.loading_images.contains(&job.dst) {
@@ -1627,13 +1672,9 @@ impl App {
         if self.current_file.as_ref() != Some(&sw.src) || !self.images.contains(&sw.dst) {
             return;
         }
-        // 保存したファイルは回転・反転済みなので、上書き保存と同じく
-        // 表示中は焼き込んだ分を差し引いて二重に回転しないようにする
-        self.applied_transform = Some((sw.dst.clone(), sw.applied));
+        // 焼き込んだ分の差し引きは finish_save で記録済み
         self.set_current_index_by_path(&sw.dst);
         self.load_current_image(ctx);
-        let name = sw.dst.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        self.show_key(&format!("新規保存: {name}"));
     }
 
     // 画像サイズの変更ダイアログを開く。入力欄の初期値は保留中のサイズ（なければ元の大きさ）
@@ -2331,6 +2372,16 @@ impl eframe::App for App {
             }
         }
 
+        // 保存結果のポップアップも同様に期限で消す
+        if let Some((_, hide_at)) = &self.save_notice {
+            let now = Instant::now();
+            if now >= *hide_at {
+                self.save_notice = None;
+            } else {
+                ctx.request_repaint_after(*hide_at - now);
+            }
+        }
+
         // ウィンドウタイトルを更新（内容が変わったときだけ送る）
         let title = self.window_title();
         if title != self.last_title {
@@ -2553,7 +2604,7 @@ impl eframe::App for App {
         }
 
         // 回転・反転・サイズ変更のオーバーレイ（左上）。いずれかをしているときだけ表示する
-        let labels = self.transform_labels(self.current_resize());
+        let labels = self.transform_labels(self.current_resize(), false);
         if !labels.is_empty() {
             let mut text = labels.into_iter().map(|(l, _)| l).collect::<Vec<_>>().join(" / ");
             // 上書き保存した画像は変換済みのファイルをそのまま表示しているので、その旨を添える
@@ -2608,6 +2659,38 @@ impl eframe::App for App {
                         );
                     });
             }
+        }
+
+        // 保存結果のポップアップ（上部中央）
+        if let Some((text, _)) = &self.save_notice {
+            let text = text.clone();
+            egui::Area::new(egui::Id::new("save_notice"))
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 40.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .show(ui, |ui| {
+                            let mut lines = text.lines();
+                            if let Some(title) = lines.next() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(title).size(16.0).strong().color(egui::Color32::WHITE),
+                                    )
+                                    .extend(),
+                                );
+                            }
+                            for line in lines {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line).size(14.0).color(egui::Color32::from_gray(220)),
+                                    )
+                                    .extend(),
+                                );
+                            }
+                        });
+                });
         }
 
         // キー操作のオーバーレイ（右下）
