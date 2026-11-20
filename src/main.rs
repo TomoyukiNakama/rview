@@ -196,6 +196,7 @@ struct App {
     pending_file_drag: bool,      // ドラッグを開始するフラグ
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     file_drag_triggered: bool,    // 現在のドラッグジェスチャで既に DnD を起動したか
+    window_drag_origin: Option<egui::Pos2>, // 右ボタンを押した位置（ウインドウ移動の判定待ちのあいだだけ Some）
     sort_order: SortOrder,        // 画像リストのソート順
     view_mode: ViewMode,          // 画像の表示方法（画像を切り替えても引き継ぐ）
     pan: egui::Vec2,              // 等倍表示でのスクロール量（画像中心の、表示領域中心からのずれ）
@@ -364,6 +365,7 @@ impl App {
             pending_file_drag: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             file_drag_triggered: false,
+            window_drag_origin: None,
             sort_order: SortOrder::Natural,
             view_mode: ViewMode::FitWindow,
             pan: egui::Vec2::ZERO,
@@ -1271,6 +1273,36 @@ impl App {
             "{}[{}]{} {}{}{}{}",
             filename, dirname, size_str, index_str, filter_str, slide_str, rot_str
         )
+    }
+
+    // 右ボタンでドラッグしたらウインドウを移動する。
+    // 押しただけでは移動を始めず、閾値以上動いてから OS に移動を任せる
+    // （そうしないと右クリックのコンテキストメニューが開けなくなる）。
+    // 移動中はポインタを OS が握るため、ボタンを離したイベントが届かないことがある。
+    // pointer.secondary_down() は離したまま残りうるので、押下・解放のイベントで判定する。
+    fn handle_window_drag(&mut self, ctx: &egui::Context) {
+        let (pressed_at, released, primary_down, latest_pos) = ctx.input(|i| {
+            let mut pressed_at = None;
+            let mut released = false;
+            for e in &i.events {
+                if let egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, .. } = e {
+                    if *pressed { pressed_at = Some(*pos); released = false; } else { released = true; }
+                }
+            }
+            (pressed_at, released, i.pointer.primary_down(), i.pointer.latest_pos())
+        });
+        if let Some(pos) = pressed_at {
+            self.window_drag_origin = Some(pos);
+        }
+        if released || primary_down {
+            self.window_drag_origin = None; // 離した、または左ボタンと同時押しなら移動しない
+            return;
+        }
+        let Some(origin) = self.window_drag_origin else { return };
+        if latest_pos.is_some_and(|pos| (pos - origin).length() >= DRAG_START_THRESHOLD) {
+            self.window_drag_origin = None; // 1ジェスチャにつき1回だけ
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
     }
 
     // ファイルがドロップされたときの処理（egui 経由 — X11 で使用）
@@ -2268,6 +2300,7 @@ impl eframe::App for App {
         }
 
         self.handle_dropped_files(ctx); // ファイルドロップを処理（X11 / egui 経由）
+        self.handle_window_drag(ctx);   // 右ボタンドラッグでウインドウを移動
         self.handle_keyboard(ctx);      // キーボード入力を処理
         self.poll_fs_events(ctx);       // フォルダ内のファイル追加・削除・変更を一覧に反映
 
