@@ -32,6 +32,9 @@ x11rb = "0.13"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-cursor = "0.31"
+# Wayland のタイトルバー（sctk-adwaita）を fontconfig 経由で描画し、日本語をフォールバックで表示する
+# （既定の ab_glyph 描画は 1 フォントだけで描くため、日本語が豆腐になる）
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-crossfont"] }
 
 
 [profile.release]
