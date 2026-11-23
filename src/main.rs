@@ -1520,12 +1520,12 @@ impl App {
                 egui::Grid::new("resize_window_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("幅：");
                     let width_resp =
-                        ui.add(egui::DragValue::new(&mut rw.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"));
+                        size_input(ui, &mut rw.width);
                     let width_changed = width_resp.changed();
                     ui.end_row();
                     ui.label("高さ：");
                     let height_resp =
-                        ui.add(egui::DragValue::new(&mut rw.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"));
+                        size_input(ui, &mut rw.height);
                     let height_changed = height_resp.changed();
                     ui.end_row();
                     if enter_pressed(&width_resp) {
@@ -1746,14 +1746,10 @@ impl App {
             ui.add_space(4.0);
             egui::Grid::new("resize_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("幅：");
-                let width_changed = ui
-                    .add(egui::DragValue::new(&mut dlg.width).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
-                    .changed();
+                let width_changed = size_input(ui, &mut dlg.width).changed();
                 ui.end_row();
                 ui.label("高さ：");
-                let height_changed = ui
-                    .add(egui::DragValue::new(&mut dlg.height).range(1..=MAX_RESIZE_SIDE).suffix(" px"))
-                    .changed();
+                let height_changed = size_input(ui, &mut dlg.height).changed();
                 ui.end_row();
                 if dlg.keep_aspect {
                     if width_changed {
@@ -2257,6 +2253,22 @@ impl App {
             }
         }
     }
+}
+
+// 幅・高さの入力欄（px）。Tab・Enter・マウスで入力欄に移ったら、入っている数値を全選択して
+// そのまま打ち直せるようにする（egui の DragValue はクリック時しか全選択しない）
+fn size_input(ui: &mut egui::Ui, value: &mut u32) -> egui::Response {
+    let response = ui.add(egui::DragValue::new(value).range(1..=MAX_RESIZE_SIDE).suffix(" px"));
+    if response.gained_focus() {
+        // 編集中の DragValue は自身と同じ ID の TextEdit として描かれるので、その選択範囲を書き換える
+        let mut state = egui::TextEdit::load_state(ui.ctx(), response.id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::default(),
+            egui::text::CCursor::new(value.to_string().chars().count()),
+        )));
+        state.store(ui.ctx(), response.id);
+    }
+    response
 }
 
 // eframe::Appトレイトの実装
