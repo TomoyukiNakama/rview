@@ -260,14 +260,14 @@ image::open(current_file)
 
 | メソッド | 役割 |
 |---|---|
-| `window_title(&self) -> String` | `filename[dir](WxH) N/Total [-Slide] [-Rotated: X°]` 形式の文字列生成 |
+| `window_title(&self) -> String` | `filename[dir] N/Total [-Slide] [-Rotated: X°]` 形式の文字列生成 |
 | `natural_sort(&mut self)` | ファイル名を自然順ソート（後述） |
 | `show_key(&mut self, text: &str)` | キーオーバーレイテキストを設定し `key_overlay_hide_at` を更新 |
 
 #### ウィンドウタイトル形式
 
 ```
-photo.jpg[/home/user/pics](1920x1080) 3/42 [-Slide] [-Rotated: 90°]
+photo.jpg[/home/user/pics] 3/42 [-Slide] [-Rotated: 90°]
 ```
 
 ---
@@ -332,7 +332,7 @@ if let Some(file) = dropped.first() {
 
 ```
 ┌─────────────────────────────────────────┐
-│ [ウィンドウタイトル: filename[dir](WxH) N/Total]
+│ [ウィンドウタイトル: filename[dir] N/Total]
 ├─────────────────────────────────────────┤
 │                                         │
 │           画像表示エリア                 │
@@ -341,6 +341,8 @@ if let Some(file) = dropped.first() {
 │  [キーオーバーレイ: 右下に半透明テキスト] │
 └─────────────────────────────────────────┘
 ```
+
+- ファイル情報: 左下にファイル名、右上に解像度（`W x H`）を半透明の背景付きで重ねる。`F` または右クリックメニューの「ファイル情報を表示 / 非表示」で両方まとめて切り替える。解像度はリサイズウインドウを開いているあいだと読み込み中は出さない
 
 - 表示方法（`ViewMode`、画像を切り替えても引き継ぐ。初期値はウインドウサイズ）
   - ウインドウサイズで表示（`FitWindow`）: 画面に収まるよう拡大・縮小して中央に表示
@@ -382,7 +384,7 @@ if let Some(file) = dropped.first() {
 | `Ctrl+←` | 270° に回転 |
 | `Ctrl+→` | 90° に回転 |
 | `Ctrl+S` | 現在の回転角で PNG として保存（PNG のみ） |
-| `F` | ファイル名の表示/非表示 |
+| `F` | ファイル情報（ファイル名・解像度）の表示/非表示 |
 | `O` | ソート順の切り替え（自然順 / 更新日順） |
 | `Ctrl+C` | ファイル本体をクリップボードにコピー |
 | `Ctrl+Shift+C` | ファイルパスをコピー |
@@ -405,7 +407,7 @@ if let Some(file) = dropped.first() {
 | 項目 | ショートカット |
 |---|---|
 | スライドショーを開始 / 停止 | `Space` |
-| ファイル名を表示 / 非表示 | `F` |
+| ファイル情報を表示 / 非表示 | `F` |
 | 等倍で表示 / ウインドウサイズで表示（今の表示方法の右端に ✔） | なし |
 | 更新日順 / 自然順にソート | `O` |
 | ファイルをコピー | `Ctrl+C` |

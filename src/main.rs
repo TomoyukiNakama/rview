@@ -36,7 +36,7 @@ enum DisplayServer {
 // 右クリックメニューのアクションを定義する列挙型
 enum MenuAction {
     ToggleSlideShow,    // スライドショーの開始/停止
-    ToggleFilename,     // ファイル名の表示/非表示
+    ToggleFileInfo,     // ファイル情報（ファイル名・解像度）の表示/非表示
     ToggleSortOrder,    // ソート順の切り替え
     CopyFile,           // ファイル本体をクリップボードにコピー（ファイラーに貼り付け可能）
     CopyFilePath,       // ファイルパスをクリップボードにコピー
@@ -172,7 +172,7 @@ struct App {
     last_scroll_shift: Option<Instant>,        // スクロールデバウンス用タイムスタンプ
     last_scroll_input: Option<Instant>,        // 最後にホイール入力があった時刻（蓄積リセット判定用）
     scroll_accumulator: f32,                  // マウスホイールのスクロール量の蓄積
-    show_filename: bool,                      // ファイル名を左下に表示するかどうか
+    show_file_info: bool,                      // ファイル情報（左下にファイル名、右上に解像度）を表示するかどうか
     last_title: String,                       // 最後に送信したウィンドウタイトル（変化時のみ送るため）
     texture_cache: std::collections::HashMap<PathBuf, TextureHandle>, // テクスチャキャッシュ
     // ドラッグアイコン用のサムネイル（テクスチャと一緒に作る。長辺 THUMBNAIL_SOURCE_SIZE）
@@ -340,7 +340,7 @@ impl App {
             last_scroll_shift: None,
             last_scroll_input: None,
             scroll_accumulator: 0.0,
-            show_filename: true,
+            show_file_info: true,
             last_title: String::new(),
             texture_cache: std::collections::HashMap::new(),
             thumbnail_cache: std::collections::HashMap::new(),
@@ -1241,12 +1241,6 @@ impl App {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        // 画像サイズ
-        let size_str = if let Some((w, h)) = self.current_image_size {
-            format!("({}x{})", w, h)
-        } else {
-            String::new()
-        };
         // インデックスと総数
         let total = self.images.len();
         let index_str = if total > 0 {
@@ -1270,8 +1264,8 @@ impl App {
         };
         // これらを結合してタイトルを生成
         format!(
-            "{}[{}]{} {}{}{}{}",
-            filename, dirname, size_str, index_str, filter_str, slide_str, rot_str
+            "{}[{}] {}{}{}{}",
+            filename, dirname, index_str, filter_str, slide_str, rot_str
         )
     }
 
@@ -1372,9 +1366,9 @@ impl App {
                 self.slide_show(next);
                 self.show_key(if next { "Slide ON" } else { "Slide OFF" });
             }
-            MenuAction::ToggleFilename => {
-                self.show_filename = !self.show_filename;
-                self.show_key(if self.show_filename { "ファイル名を表示" } else { "ファイル名を非表示" });
+            MenuAction::ToggleFileInfo => {
+                self.show_file_info = !self.show_file_info;
+                self.show_key(if self.show_file_info { "ファイル情報を表示" } else { "ファイル情報を非表示" });
             }
             MenuAction::ToggleSortOrder => {
                 self.sort_order = if self.sort_order == SortOrder::Natural {
@@ -1972,7 +1966,7 @@ impl App {
         if k.space {
             self.apply_menu_action(MenuAction::ToggleSlideShow, ctx);
         }
-        if k.f   { self.apply_menu_action(MenuAction::ToggleFilename, ctx); }
+        if k.f   { self.apply_menu_action(MenuAction::ToggleFileInfo, ctx); }
         if k.o   { self.apply_menu_action(MenuAction::ToggleSortOrder, ctx); }
         if k.f5  { self.apply_menu_action(MenuAction::Reload, ctx); }
         if k.delete { self.apply_menu_action(MenuAction::Delete, ctx); }
@@ -2438,7 +2432,7 @@ impl eframe::App for App {
 
             // クロージャ内で`self`を借用しないように、必要な状態をコピーしておく
             let is_sliding    = self.is_sliding;
-            let show_filename = self.show_filename;
+            let show_file_info = self.show_file_info;
             let has_file      = self.current_file.is_some();
             let sort_order    = self.sort_order;
             let resize_window_open = self.resize_window.open;
@@ -2459,10 +2453,10 @@ impl eframe::App for App {
                     ui.close_menu();
                 }
 
-                // ファイル名表示切替
-                let fname_label = if show_filename { "ファイル名を非表示" } else { "ファイル名を表示" };
+                // ファイル情報（ファイル名・解像度）の表示切替
+                let fname_label = if show_file_info { "ファイル情報を非表示" } else { "ファイル情報を表示" };
                 if item(ui, fname_label, "F") {
-                    menu_action = Some(MenuAction::ToggleFilename);
+                    menu_action = Some(MenuAction::ToggleFileInfo);
                     ui.close_menu();
                 }
 
@@ -2672,7 +2666,7 @@ impl eframe::App for App {
         }
 
         // ファイル名オーバーレイ（左下）
-        if self.show_filename {
+        if self.show_file_info {
             if let Some(ref path) = self.current_file {
                 let name = path
                     .file_name()
@@ -2689,6 +2683,28 @@ impl eframe::App for App {
                                 .size(14.0)
                                 .color(egui::Color32::WHITE)
                                 .background_color(egui::Color32::from_black_alpha(180)),
+                        );
+                    });
+            }
+        }
+
+        // 解像度オーバーレイ（右上）。リサイズウインドウと重なるので、それが開いているあいだは出さない。
+        // 読み込み中は右上にスピナーを出し、サイズもまだ前の画像のものなので出さない
+        let loading = self.current_texture.is_none() && self.current_file.is_some();
+        if self.show_file_info && !self.resize_window.open && !loading {
+            if let Some((w, h)) = self.current_image_size {
+                egui::Area::new(egui::Id::new("resolution_overlay"))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{} x {}", w, h))
+                                    .size(14.0)
+                                    .color(egui::Color32::WHITE)
+                                    .background_color(egui::Color32::from_black_alpha(180)),
+                            )
+                            .extend(),
                         );
                     });
             }
